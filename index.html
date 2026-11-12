@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>내 관심종목</title>
+<style>
+  :root { --bg:#0f1729; --card:#1a2440; --line:#2a3658; --text:#e8edf5; --sub:#9aa9c2; --up:#ff5b5b; --down:#4c9dff; --accent:#d9682b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: -apple-system, "Noto Sans KR", "Apple SD Gothic Neo", sans-serif; }
+  header { padding:18px 16px 10px; }
+  h1 { margin:0; font-size:22px; }
+  .meta { color:var(--sub); font-size:13px; margin-top:6px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .badge { padding:2px 8px; border-radius:10px; background:var(--line); font-size:12px; }
+  .badge.mock { background:#5a4a1a; color:#ffd27a; }
+  main { padding:0 16px 32px; }
+  .btns { display:flex; gap:8px; margin:10px 0 14px; }
+  button { flex:1; padding:12px; border:0; border-radius:10px; font-size:15px; font-weight:700; background:var(--line); color:var(--text); }
+  button.primary { background:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; }
+  .card { background:var(--card); border-radius:12px; padding:12px 14px; margin-bottom:10px; }
+  .row1 { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .name { font-weight:700; font-size:15px; }
+  .price { font-size:20px; font-weight:800; }
+  .row2 { display:flex; justify-content:space-between; color:var(--sub); font-size:13px; margin-top:4px; gap:8px; flex-wrap:wrap; }
+  .up { color:var(--up); } .down { color:var(--down); }
+  .err { color:#ffb3b3; font-size:13px; }
+  .ai { white-space:pre-wrap; line-height:1.6; font-size:14px; }
+  .note { color:var(--sub); font-size:12px; margin-top:8px; }
+  details { background:var(--card); border-radius:12px; padding:10px 14px; margin-top:16px; }
+  summary { font-weight:700; }
+  label { display:block; font-size:13px; color:var(--sub); margin:10px 0 4px; }
+  input, textarea { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0c1322; color:var(--text); font-size:14px; }
+  textarea { min-height:150px; font-family: ui-monospace, monospace; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 내 관심종목</h1>
+  <div class="meta"><span id="when">아직 조회 전</span><span id="mode" class="badge" hidden></span></div>
+</header>
+<main>
+  <div class="btns">
+    <button id="refresh" class="primary">새로고침</button>
+    <button id="analyze">AI 분석</button>
+  </div>
+  <div id="list"></div>
+  <div id="aiBox" class="card" hidden><div class="ai" id="aiText"></div>
+    <div class="note">참고용 정보이며 투자 판단과 책임은 본인에게 있습니다.</div></div>
+
+  <details id="settings">
+    <summary>⚙️ 설정 (이 폰에만 저장)</summary>
+    <label>Worker 주소</label>
+    <input id="workerUrl" placeholder="https://my-stock.아이디.workers.dev" inputmode="url">
+    <label>접속 PIN (Cloudflare에 넣은 ACCESS_PIN과 같게)</label>
+    <input id="pin" type="password" inputmode="numeric">
+    <label>관심종목 — 한 줄에 하나: 이름,코드,매수가,손절가,익절가 (뒤 3개는 비워도 됨)</label>
+    <textarea id="watch"></textarea>
+    <div class="btns"><button id="save" class="primary">저장</button></div>
+    <div class="note">매수가·손절가는 이 폰 브라우저에만 저장되고 서버·AI로 보내지 않습니다. 종목코드는 증권 앱에서 한 번 확인하세요.</div>
+  </details>
+</main>
+
+<script>
+const DEFAULT_WATCH = [
+  'TIGER 미국배당다우존스,458730,,,',
+  'TIGER 미국S&P500,360750,,,',
+  'ACE 미국S&P500,360200,,,',
+  'TIGER 미국나스닥100,133690,,,',
+  'NAVER,035420,,,',
+].join('\n');
+
+// localStorage는 막힐 수 있으므로 항상 try/catch
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+const $ = (id) => document.getElementById(id);
+let lastItems = [];
+
+function parseWatch(text) {
+  return text.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+    const [name, code, buy, stop, target] = l.split(',').map((s) => (s || '').trim());
+    return { name, code, buy: Number(buy) || 0, stop: Number(stop) || 0, target: Number(target) || 0 };
+  }).filter((w) => w.name && /^[0-9A-Z]{6,7}$/.test(w.code));
+}
+
+function loadSettings() {
+  $('workerUrl').value = store.get('workerUrl', '');
+  $('pin').value = store.get('pin', '');
+  $('watch').value = store.get('watch', DEFAULT_WATCH);
+  if (!$('workerUrl').value || !$('pin').value) $('settings').open = true;
+}
+
+function fmt(n) { return Number(n).toLocaleString('ko-KR'); }
+function pct(a, b) { return ((a / b - 1) * 100).toFixed(2); }
+function cls(n) { return n > 0 ? 'up' : n < 0 ? 'down' : ''; }
+function sign(n) { return n > 0 ? '▲' : n < 0 ? '▼' : '-'; }
+
+function render(watch, items) {
+  const byCode = Object.fromEntries(items.map((i) => [i.code, i]));
+  $('list').innerHTML = watch.map((w) => {
+    const it = byCode[w.code];
+    if (!it) return '';
+    if (it.error) return `<div class="card"><div class="name">${esc(w.name)}</div><div class="err">${esc(it.error)}</div></div>`;
+    let extra = '';
+    if (w.buy) extra += `<span class="${cls(it.price - w.buy)}">내 수익률 ${pct(it.price, w.buy)}%</span>`;
+    if (w.stop) extra += `<span>손절까지 ${pct(w.stop, it.price)}%</span>`;
+    if (w.target) extra += `<span>익절까지 +${pct(w.target, it.price)}%</span>`;
+    return `<div class="card">
+      <div class="row1"><span class="name">${esc(w.name)}</span><span class="price ${cls(it.change)}">${fmt(it.price)}</span></div>
+      <div class="row2"><span class="${cls(it.change)}">${sign(it.change)} ${fmt(Math.abs(it.change))} (${it.rate}%)</span>
+        <span>고 ${fmt(it.high)} · 저 ${fmt(it.low)}</span></div>
+      ${extra ? `<div class="row2">${extra}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+
+async function call(path, opts = {}) {
+  const base = store.get('workerUrl', '').replace(/\/+$/, '');
+  if (!base) throw new Error('설정에서 Worker 주소를 입력하세요');
+  const res = await fetch(base + path, { ...opts, headers: { ...(opts.headers || {}), 'x-pin': store.get('pin', '') } });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `오류 ${res.status}`);
+  return data;
+}
+
+async function refresh() {
+  const watch = parseWatch(store.get('watch', DEFAULT_WATCH));
+  if (!watch.length) { $('list').innerHTML = '<div class="err">관심종목이 없습니다</div>'; return; }
+  $('refresh').disabled = true; $('refresh').textContent = '조회 중…';
+  try {
+    const data = await call('/price?codes=' + watch.map((w) => w.code).join(','));
+    lastItems = data.items.map((i) => ({ ...i, name: (watch.find((w) => w.code === i.code) || {}).name }));
+    render(watch, data.items);
+    const t = new Date(data.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    $('when').textContent = `조회 ${t} KST` + (isMarketOpen() ? '' : ' · 장 마감 기준');
+    $('mode').hidden = false;
+    $('mode').textContent = data.mode === 'real' ? '실전 시세' : '모의투자 서버';
+    $('mode').className = 'badge' + (data.mode === 'real' ? '' : ' mock');
+  } catch (e) {
+    $('list').innerHTML = `<div class="card err">${esc(e.message)}</div>`;
+  } finally {
+    $('refresh').disabled = false; $('refresh').textContent = '새로고침';
+  }
+}
+
+function isMarketOpen() {
+  const k = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const d = k.getDay(), m = k.getHours() * 60 + k.getMinutes();
+  return d >= 1 && d <= 5 && m >= 540 && m <= 930; // 평일 09:00~15:30
+}
+
+async function analyze() {
+  const ok = lastItems.filter((i) => !i.error);
+  if (!ok.length) { await refresh(); }
+  const items = lastItems.filter((i) => !i.error).map(({ name, price, change, rate }) => ({ name, price, change, rate }));
+  if (!items.length) return;
+  $('analyze').disabled = true; $('analyze').textContent = '분석 중…';
+  $('aiBox').hidden = false; $('aiText').textContent = '분석 중입니다…';
+  try {
+    const data = await call('/analyze', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ items }) });
+    $('aiText').textContent = data.text;
+  } catch (e) {
+    $('aiText').textContent = e.message;
+  } finally {
+    $('analyze').disabled = false; $('analyze').textContent = 'AI 분석';
+  }
+}
+
+$('save').onclick = () => {
+  store.set('workerUrl', $('workerUrl').value.trim());
+  store.set('pin', $('pin').value.trim());
+  store.set('watch', $('watch').value);
+  $('settings').open = false;
+  refresh();
+};
+$('refresh').onclick = refresh;
+$('analyze').onclick = analyze;
+
+loadSettings();
+if (store.get('workerUrl', '') && store.get('pin', '')) refresh();
+</script>
+</body>
+</html>
