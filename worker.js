@@ -394,7 +394,10 @@ async function callGemini(env, payload) {
   const data = await res.json().catch(() => ({}));
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
   if (!text) {
-    return { error: res.status === 429 ? '무료 한도 초과입니다. 잠시 후 다시 시도하세요.' : `AI 응답 실패 (${res.status})` };
+    if (res.status === 429) return { error: '무료 한도 초과입니다. 잠시 후 다시 시도하세요.' };
+    // Gemini가 준 오류 설명을 함께 보여줌 (키 값은 포함되지 않음)
+    const why = data?.error?.message || data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || '';
+    return { error: `AI 응답 실패 (${res.status}) [${model}] ${String(why).slice(0, 300)}`.trim() };
   }
   return { text };
 }
@@ -461,7 +464,7 @@ async function handleAsk(request, env, origin) {
 
   const nowKst = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
   const result = await callGemini(env, {
-    system_instruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}` }] },
+    systemInstruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}` }] },
     contents: [...history, { role: 'user', parts: [{ text: question }] }],
   });
   return json(result, result.error ? 502 : 200, origin);
