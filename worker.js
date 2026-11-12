@@ -301,7 +301,7 @@ const isFullDay = (mins) => mins.length > 0 && mins[0].hm <= '091000' && mins[mi
 const forChart = (bars) => bars.map((b) => ({ t: toTs(b.d, b.hm), o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }));
 
 // ---------------------------------------------------------------------
-// 상세 차트 데이터: 일봉 + 60분봉(최근 7거래일) + 1분봉(최근 거래일)
+// 상세 차트 데이터: 일봉(약 100거래일) + 60분봉(최근 7거래일, 1분봉을 모아 만듦)
 // 지난 날짜의 60분봉은 바뀌지 않으므로 KV에 저장해 재사용 (호출 수 절약)
 // ---------------------------------------------------------------------
 async function handleChart(request, env, origin) {
@@ -327,14 +327,12 @@ async function handleChart(request, env, origin) {
     const cached = env.TOKEN_KV
       ? await Promise.all(past.map((d) => env.TOKEN_KV.get(`h60:${code}:${d}`, 'json').catch(() => null)))
       : past.map(() => null);
-    let prevMinutes = null;
     for (let i = 0; i < past.length; i++) {
       let hourly = cached[i];
       if (!hourly) {
         try {
           await sleep(callGap(env));
           const mins = await fetchDayMinutesReal(env, token, code, past[i], '153000');
-          if (i === past.length - 1) prevMinutes = mins;
           hourly = toHourly(mins);
           if (env.TOKEN_KV && isFullDay(mins)) {
             await env.TOKEN_KV.put(`h60:${code}:${past[i]}`, JSON.stringify(hourly), { expirationTtl: 20 * 86400 });
@@ -347,17 +345,6 @@ async function handleChart(request, env, origin) {
       h60.push(...hourly);
     }
     h60.push(...toHourly(m1));
-
-    // 장 초반이라 1분봉이 적으면 전날 마지막 120개를 앞에 붙여 밴드가 바로 보이게
-    if (m1.length < 60 && past.length) {
-      try {
-        if (!prevMinutes) {
-          await sleep(callGap(env));
-          prevMinutes = await fetchDayMinutesReal(env, token, code, past[past.length - 1], '153000', 1);
-        }
-        m1 = [...prevMinutes.slice(-120), ...m1];
-      } catch (e) { /* 없어도 진행 */ }
-    }
   } else {
     await sleep(callGap(env));
     const live = now.hms >= '090000' && now.hms < '153000';
@@ -376,7 +363,6 @@ async function handleChart(request, env, origin) {
     rate: daily.rate,
     daily: forChart(daily.bars),
     h60: forChart(h60),
-    m1: forChart(m1),
     notes,
   }, 200, origin);
 }
@@ -433,13 +419,13 @@ ${lines}
 // context: 화면에서 계산한 일봉·60분봉·1분봉 시세와 밴드 값 (텍스트)
 // ---------------------------------------------------------------------
 const SWING_PROMPT = `너는 한국 주식·ETF 스윙 트레이딩(보유 기간 며칠~몇 주) 관점의 기술적 분석 도우미다.
-사용자는 볼린저밴드(20, 2σ)를 쓰며, 60분봉으로 흐름과 매매 구간을, 1분봉으로 실제 진입·청산 타이밍을 잡는다. 일봉은 큰 추세 참고용이다.
+사용자는 볼린저밴드(20, 2σ)를 쓰며, 일봉으로 큰 흐름과 매매 구간을, 60분봉으로 실제 진입·청산 타이밍을 잡는다.
 아래 [차트 데이터]만 근거로 답하라.
 
 기본 답변 형식 (질문이 구체적이면 그 질문에 맞춰 더 짧게):
 1) 결론: 매수 관점 / 매도·익절 관점 / 관망 중 하나 + 확신도(높음·보통·낮음) + 한 줄 이유
-2) 60분봉: 밴드 안 위치(%B), 밴드폭 수축·확장, 중심선 기울기, 상단·하단 터치 흐름
-3) 1분봉: 지금 단기 위치와 바로 쓸 수 있는 진입·청산 신호
+2) 일봉: 밴드 안 위치(%B), 밴드폭 수축·확장, 중심선 기울기, 상단·하단 터치 흐름
+3) 60분봉: 지금 단기 위치와 바로 쓸 수 있는 진입·청산 신호 (60분봉 밴드가 없으면 그 사실을 밝히고 일봉 위주로)
 4) 가격대: 분할매수 고려 구간 / 익절 구간 / 손절 기준 — 반드시 밴드 값 등 데이터의 숫자를 근거로 제시
 5) 대응 시나리오: "○○원 위로 가면 …, ○○원 아래로 가면 …" 2~3줄
 

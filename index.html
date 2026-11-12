@@ -84,7 +84,7 @@
     <button id="analyze">AI 분석</button>
   </div>
   <div id="list"></div>
-  <div class="note">종목을 누르면 60분봉·1분봉 볼린저밴드와 AI 질문 화면이 열립니다.</div>
+  <div class="note">종목을 누르면 60분봉·일봉 볼린저밴드와 AI 질문 화면이 열립니다.</div>
   <div id="aiBox" class="card" hidden style="margin-top:10px"><div class="ai" id="aiText"></div>
     <div class="note">참고용 정보이며 투자 판단과 책임은 본인에게 있습니다.</div></div>
 
@@ -122,7 +122,7 @@
       <div class="stats" id="st60"></div>
     </div>
     <div class="chartCard">
-      <div class="chartHead"><b>1분봉 · BB(20,2)</b><span class="legend" id="lg1"></span></div>
+      <div class="chartHead"><b>일봉 · BB(20,2)</b><span class="legend" id="lg1"></span></div>
       <div class="chart small" id="c1"></div>
       <div class="stats" id="st1"></div>
     </div>
@@ -130,11 +130,11 @@
     <div class="card chat">
       <div class="row1"><b>🤖 AI에게 묻기</b><span class="note" style="margin:0">스윙 관점 · 현재 차트 숫자 기반</span></div>
       <div class="qs" id="quick">
-        <button data-q="지금 60분봉·1분봉 볼린저밴드 기준으로 종합 판단해줘">종합 판단</button>
-        <button data-q="지금이 매수 타이밍이야? 분할매수 구간과 1분봉 진입 신호를 알려줘">매수 타이밍</button>
-        <button data-q="지금 매도·익절 타이밍이야? 익절 구간과 1분봉 청산 신호를 알려줘">매도 타이밍</button>
+        <button data-q="지금 일봉·60분봉 볼린저밴드 기준으로 종합 판단해줘">종합 판단</button>
+        <button data-q="지금이 매수 타이밍이야? 일봉 기준 분할매수 구간과 60분봉 진입 신호를 알려줘">매수 타이밍</button>
+        <button data-q="지금 매도·익절 타이밍이야? 일봉 기준 익절 구간과 60분봉 청산 신호를 알려줘">매도 타이밍</button>
         <button data-q="손절 기준을 어디로 잡아야 할까? 밴드 값 근거로 알려줘">손절 기준</button>
-        <button data-q="60분봉 밴드폭이 수축(스퀴즈) 중이야? 돌파 방향 대응법을 알려줘">스퀴즈?</button>
+        <button data-q="일봉·60분봉 밴드폭이 수축(스퀴즈) 중이야? 돌파 방향 대응법을 알려줘">스퀴즈?</button>
       </div>
       <div class="log" id="chatLog"></div>
       <label class="chk" id="sendPosWrap" hidden><input type="checkbox" id="sendPos"> 내 매수가·손절가·익절가 함께 보내기</label>
@@ -320,7 +320,7 @@ function legendHtml(st) {
 // =====================================================================
 const charts = {};
 
-function drawChart(key, el, bars, bb, lines, visibleBars) {
+function drawChart(key, el, bars, bb, lines, visibleBars, intraday) {
   if (charts[key]) { charts[key].remove(); delete charts[key]; }
   el.innerHTML = '';
   if (!window.LightweightCharts) { el.innerHTML = '<div class="err loading">차트 라이브러리를 불러오지 못했습니다</div>'; return; }
@@ -331,7 +331,7 @@ function drawChart(key, el, bars, bb, lines, visibleBars) {
     layout: { background: { type: 'solid', color: '#1a2440' }, textColor: '#9aa9c2', fontSize: 11 },
     grid: { vertLines: { color: '#222d4d' }, horzLines: { color: '#222d4d' } },
     rightPriceScale: { borderColor: '#2a3658' },
-    timeScale: { borderColor: '#2a3658', timeVisible: true, secondsVisible: false, rightOffset: 3 },
+    timeScale: { borderColor: '#2a3658', timeVisible: !!intraday, secondsVisible: false, rightOffset: 3 },
     crosshair: { mode: 0 },
     handleScroll: { vertTouchDrag: false },
     localization: { priceFormatter: (p) => fmt(p) },
@@ -362,7 +362,7 @@ function drawChart(key, el, bars, bb, lines, visibleBars) {
 // 상세 화면
 // =====================================================================
 const chats = {};           // 종목코드별 대화 기록 (이 화면에 있는 동안만)
-let cur = null;             // { code, w, data, h60, m1, bb60, bb1, st60, st1, stD }
+let cur = null;             // { code, w, data, bb60, st60, bbD, stD }
 let cameFromList = false;
 
 function labelOf(t, withDate) {
@@ -421,19 +421,18 @@ function renderDetail() {
   $('dPos').innerHTML = pos;
   $('dNotes').innerHTML = (data.notes || []).map((n) => `<div class="card note" style="margin-top:0">${esc(n)}</div>`).join('');
 
-  cur.bb60 = bollinger(data.h60); cur.st60 = bbStats(data.h60, cur.bb60);
-  cur.bb1 = bollinger(data.m1);   cur.st1 = bbStats(data.m1, cur.bb1);
-  const bbD = bollinger(data.daily); cur.stD = bbStats(data.daily, bbD); cur.bbD = bbD;
+  cur.bb60 = bollinger(data.h60);  cur.st60 = bbStats(data.h60, cur.bb60);
+  cur.bbD = bollinger(data.daily); cur.stD = bbStats(data.daily, cur.bbD);
 
   const lines = [];
   if (w.buy) lines.push({ price: w.buy, color: '#e8edf5', title: '매수' });
   if (w.stop) lines.push({ price: w.stop, color: '#4c9dff', title: '손절' });
   if (w.target) lines.push({ price: w.target, color: '#ff5b5b', title: '익절' });
 
-  drawChart('c60', $('c60'), data.h60, cur.bb60, lines, 60);
-  drawChart('c1', $('c1'), data.m1, cur.bb1, lines, 120);
+  drawChart('c60', $('c60'), data.h60, cur.bb60, lines, 60, true);
+  drawChart('c1', $('c1'), data.daily, cur.bbD, lines, 80, false);
   $('lg60').innerHTML = legendHtml(cur.st60); $('st60').innerHTML = statChips(cur.st60);
-  $('lg1').innerHTML = legendHtml(cur.st1);   $('st1').innerHTML = statChips(cur.st1);
+  $('lg1').innerHTML = legendHtml(cur.stD);   $('st1').innerHTML = statChips(cur.stD);
 }
 
 // AI에게 보낼 차트 요약 (숫자만, 보유 수량·금액은 없음)
@@ -450,9 +449,8 @@ function buildContext() {
 
   let s = `[종목] ${w.name || data.name} (${data.code}) 현재가 ${data.price}원, 전일대비 ${data.change}원 (${data.rate}%)\n`;
   s += `[시세 서버] ${data.mode === 'real' ? '실전' : '모의투자'} / 장 ${isMarketOpen() ? '진행 중' : '마감 또는 개장 전'}\n\n`;
-  s += `[일봉 BB(20,2) 요약] ${statLine(cur.stD)}\n최근 일봉 10개:\n${rows(data.daily, cur.bbD, 10, true).replace(/ 00:00/g, '')}\n\n`;
-  s += `[60분봉 BB(20,2) 요약] ${statLine(cur.st60)}\n최근 60분봉 ${Math.min(24, data.h60.length)}개 (시각=구간 시작):\n${rows(data.h60, cur.bb60, 24, true)}\n\n`;
-  s += `[1분봉 BB(20,2) 요약] ${statLine(cur.st1)}\n최근 1분봉 ${Math.min(40, data.m1.length)}개:\n${rows(data.m1, cur.bb1, 40, true)}\n`;
+  s += `[일봉 BB(20,2) 요약] ${statLine(cur.stD)}\n최근 일봉 ${Math.min(30, data.daily.length)}개:\n${rows(data.daily, cur.bbD, 30, true).replace(/ 00:00/g, '')}\n\n`;
+  s += `[60분봉 BB(20,2) 요약] ${statLine(cur.st60)}\n최근 60분봉 ${Math.min(35, data.h60.length)}개 (시각=구간 시작):\n${rows(data.h60, cur.bb60, 35, true)}\n`;
   if ($('sendPos').checked && (w.buy || w.stop || w.target)) {
     s += `\n[내 포지션] ` + [w.buy && `매수가 ${w.buy}원(현재 ${pct(data.price, w.buy)}%)`, w.stop && `손절가 ${w.stop}원`, w.target && `익절가 ${w.target}원`].filter(Boolean).join(', ') + '\n';
   }
