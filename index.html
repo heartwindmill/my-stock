@@ -63,6 +63,9 @@
   .msg.user { align-self:flex-end; background:#3a2a1f; max-width:85%; }
   .msg.model { background:#0c1322; border:1px solid var(--line); }
   .msg.error { background:#3a1c22; color:#ffb3b3; }
+  .mdt { border-collapse:collapse; width:100%; margin:4px 0; font-size:13px; white-space:normal; }
+  .mdt td { border:1px solid var(--line); padding:4px 6px; vertical-align:top; }
+  .mdt tr:first-child td { color:var(--sub); font-weight:700; }
   .facts summary { cursor:pointer; }
   .facts ul { margin:10px 0 0; padding-left:18px; font-size:13px; line-height:1.55; }
   .facts li { margin-bottom:4px; word-break:keep-all; overflow-wrap:anywhere; }
@@ -143,11 +146,11 @@
     <div class="card chat">
       <div class="row1"><b>🤖 AI에게 묻기</b><span class="note" style="margin:0">스윙 관점 · 현재 차트 숫자 기반</span></div>
       <div class="qs" id="quick">
-        <button data-q="지금 일봉·60분봉 볼린저밴드 기준으로 종합 판단해줘">종합 판단</button>
-        <button data-q="지금이 매수 타이밍이야? 일봉 기준 분할매수 구간과 60분봉 진입 신호를 알려줘">매수 타이밍</button>
-        <button data-q="지금 매도·익절 타이밍이야? 일봉 기준 익절 구간과 60분봉 청산 신호를 알려줘">매도 타이밍</button>
-        <button data-q="손절 기준을 어디로 잡아야 할까? 밴드 값 근거로 알려줘">손절 기준</button>
-        <button data-q="일봉·60분봉 밴드폭이 수축(스퀴즈) 중이야? 돌파 방향 대응법을 알려줘">스퀴즈?</button>
+        <button data-preset="overall">종합 판단</button>
+        <button data-preset="buy">매수 타이밍</button>
+        <button data-preset="sell">매도 타이밍</button>
+        <button data-preset="stop">손절 기준</button>
+        <button data-preset="squeeze">스퀴즈?</button>
       </div>
       <details class="memo" id="memoBox">
         <summary>📝 내 계획·이벤트 메모 <span class="saved" id="memoState"></span></summary>
@@ -506,12 +509,36 @@ function saveMemo(kind) {
   memoState();
 }
 
-// 간단한 마크다운(**굵게**, 글머리표)만 표시
+// 간단한 마크다운(**굵게**, 제목, 글머리표, 표)만 표시
 function mdLite(text) {
-  return esc(text)
-    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-    .replace(/^#{1,4}\s*(.+)$/gm, '<b>$1</b>')
-    .replace(/^\s*[*-]\s+/gm, '• ');
+  const inline = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  const out = [];
+  let table = null;
+  const flush = () => { if (table) { out.push(`<table class="mdt">${table.join('')}</table>`); table = null; } };
+  for (const line of String(text).split('\n')) {
+    const t = line.trim();
+    if (/^\|.*\|$/.test(t)) {
+      if (/^\|[\s:|-]+\|$/.test(t)) continue; // 구분선 |---|---|
+      const cells = t.slice(1, -1).split('|').map((c) => `<td>${inline(c.trim())}</td>`).join('');
+      (table = table || []).push(`<tr>${cells}</tr>`);
+      continue;
+    }
+    flush();
+    const h = t.match(/^#{1,4}\s*(.+)$/);
+    if (h) { out.push(`<b>${inline(h[1])}</b>`); continue; }
+    out.push(inline(line).replace(/^\s*[*-]\s+/, '• '));
+  }
+  flush();
+  return out.join('\n').replace(/<\/table>\n/g, '</table>');
+}
+
+const PRESET_LABEL = { overall: '종합 판단', buy: '매수 타이밍', sell: '매도 타이밍', stop: '손절 기준', squeeze: '스퀴즈?' };
+
+// 체크했을 때만 보내는 내 포지션 (가격만, 수량 없음)
+function positionLine() {
+  const { data, w } = cur;
+  if (!$('sendPos').checked || !(w.buy || w.stop || w.target)) return '';
+  return '내 포지션: ' + [w.buy && `매수가 ${fmt(w.buy)}원(현재 ${pct(data.price, w.buy)}%)`, w.stop && `손절가 ${fmt(w.stop)}원`, w.target && `익절가 ${fmt(w.target)}원`].filter(Boolean).join(', ');
 }
 
 function renderChat() {
@@ -520,14 +547,20 @@ function renderChat() {
     `<div class="msg ${m.role}${m.error ? ' error' : ''}">${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}</div>`).join('');
 }
 
-async function ask(question) {
+async function ask(question, preset) {
   question = (question || '').trim();
-  if (!question || !cur) return;
+  if ((!question && !preset) || !cur) return;
   if (!cur.data) { alert('차트를 불러온 뒤에 질문하세요'); return; }
   const code = cur.code;
   const list = (chats[code] = chats[code] || []);
-  const history = list.filter((m) => !m.error && !m.pending).slice(-8).map(({ role, text }) => ({ role, text }));
-  list.push({ role: 'user', text: question });
+  // 직전 2턴(질문+답)만 보내고, Worker가 답의 '결론'만 요약해 넣음
+  const turns = [];
+  for (let i = 0; i < list.length - 1; i++) {
+    const a = list[i], b = list[i + 1];
+    if (a.role === 'user' && b.role === 'model' && !b.error && !b.pending) turns.push({ q: a.text, a: b.text });
+  }
+  const facts = cur.data.facts && !cur.data.facts.error ? cur.data.facts.lines : [];
+  list.push({ role: 'user', text: question || PRESET_LABEL[preset] });
   const pending = { role: 'model', text: '분석 중입니다…', pending: true };
   list.push(pending);
   renderChat();
@@ -540,8 +573,10 @@ async function ask(question) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        question, history, context: buildContext(),
+        question, preset, turns: turns.slice(-2), facts,
+        ...(facts.length ? {} : { context: buildContext() }), // 판단 재료 계산 실패 시에만 예전 요약
         price: cur.data.price,
+        position: positionLine(),
         ...($('sendPlan').checked ? { plan: $('planMemo').value.trim(), event: $('eventMemo').value.trim() } : {}),
       }),
     });
@@ -572,7 +607,7 @@ $('list').addEventListener('click', (e) => {
 });
 $('back').onclick = () => { if (cameFromList) history.back(); else location.hash = ''; cameFromList = false; };
 $('dRefresh').onclick = loadChart;
-$('quick').addEventListener('click', (e) => { const b = e.target.closest('button[data-q]'); if (b) ask(b.dataset.q); });
+$('quick').addEventListener('click', (e) => { const b = e.target.closest('button[data-preset]'); if (b) ask('', b.dataset.preset); });
 $('send').onclick = () => ask($('q').value);
 $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask($('q').value); } });
 $('sendPos').onchange = () => store.set('sendPos', $('sendPos').checked ? '1' : '0');

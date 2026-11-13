@@ -711,26 +711,45 @@ ${lines}
 }
 
 // ---------------------------------------------------------------------
-// AI 질문 (상세 화면) — 스윙 관점, 볼린저밴드 기반 매수·매도 타이밍 대화
-// context: 화면에서 계산한 일봉·60분봉·1분봉 시세와 밴드 값 (텍스트)
+// AI 질문 (상세 화면) — 스윙 관점 분석 도우미
+// 사용자 메시지 = [사실](판단 재료) + [사용자 계획] + [이벤트] + [이전 대화 요약] + [질문]
 // ---------------------------------------------------------------------
-const SWING_PROMPT = `너는 한국 주식·ETF 스윙 트레이딩(보유 기간 며칠~몇 주) 관점의 기술적 분석 도우미다.
-사용자는 볼린저밴드(20, 2σ)를 쓰며, 일봉으로 큰 흐름과 매매 구간을, 60분봉으로 실제 진입·청산 타이밍을 잡는다.
-아래 [차트 데이터]만 근거로 답하라.
+const ADVISOR_PROMPT = `너는 한국 주식 스윙 매매를 돕는 신중한 분석 도우미다.
+반드시 아래 [사실] 목록에 있는 숫자·날짜만 사용하라. 목록에 없는 가격, 뉴스, 실적, 일정은 만들지 말고 필요하면 "확인 필요"라고 써라.
+답변 형식(제목 그대로 사용):
+결론: (한두 문장. 지금 할 행동을 '대기/분할 검토/보유 유지/비중 축소 검토' 중 하나로, 이유 한 줄)
+화면 확인 (기준시각): 핵심 수치 3~5개 불릿
+판단 근거: 2~4행 표 (항목 | 내용). 이벤트, 지지/저항, 손절 폭 대비 변동성, 헤드룸 중 해당되는 것
+종가 조건별 다음 계획: "종가 X 위: … / 종가 X 아래: …" 2~3줄. 사용자 계획이 있으면 그 이름(A안·B안)과 가격을 그대로 사용
+반대 근거: 1~2줄. 내 결론이 틀릴 수 있는 이유와 그 경우의 비용
+마지막 줄: "참고용 정보이며 투자 판단과 책임은 본인에게 있습니다."
+규칙: 매수·매도 단정, 수익 보장, 목표가 확언 금지. 손절 기준은 항상 '종가 기준 가격'으로 제시. 연금 계좌 ETF는 장기 분산 관점 유지. 쉬운 한국어, 결론 먼저.`;
 
-기본 답변 형식 (질문이 구체적이면 그 질문에 맞춰 더 짧게):
-1) 결론: 매수 관점 / 매도·익절 관점 / 관망 중 하나 + 확신도(높음·보통·낮음) + 한 줄 이유
-2) 일봉: 밴드 안 위치(%B), 밴드폭 수축·확장, 중심선 기울기, 상단·하단 터치 흐름
-3) 60분봉: 지금 단기 위치와 바로 쓸 수 있는 진입·청산 신호 (60분봉 밴드가 없으면 그 사실을 밝히고 일봉 위주로)
-4) 가격대: 분할매수 고려 구간 / 익절 구간 / 손절 기준 — 반드시 밴드 값 등 데이터의 숫자를 근거로 제시
-5) 대응 시나리오: "○○원 위로 가면 …, ○○원 아래로 가면 …" 2~3줄
+// 빠른 질문 버튼: 질문 유형별 강조점
+const PRESETS = {
+  overall: {
+    q: '지금 일봉·60분봉 기준으로 종합 판단해줘',
+    focus: '전체 형식을 균형 있게 채우고, 결론의 행동 하나를 분명히 할 것.',
+  },
+  buy: {
+    q: '지금이 매수 타이밍이야?',
+    focus: '진입 조건(어떤 종가·신호가 나오면 들어가는지)과 분할 매수 가격대 2~3개를 [사실]의 지지선 숫자로 제시. 진입 시 손절 종가도 함께.',
+  },
+  sell: {
+    q: '지금 매도·익절 타이밍이야?',
+    focus: '익절·분할 매도 조건과 가격대를 [사실]의 저항선 숫자로 제시. 남은 물량을 계속 보유할 조건도 함께.',
+  },
+  stop: {
+    q: '손절 기준을 어디로 잡아야 할까?',
+    focus: '종가 기준 손절선 1~2개와 근거(어느 지지선 아래인지, 평균 일중 변동폭 대비 거리). 손절 폭이 너무 좁으면 노이즈 위험을 지적.',
+  },
+  squeeze: {
+    q: '밴드폭이 수축(스퀴즈) 중이야?',
+    focus: '일봉·60분봉 밴드폭과 20봉 평균을 비교해 수축/확장을 해석하고, 위·아래 돌파 각각의 종가 조건과 대응을 제시.',
+  },
+};
 
-규칙:
-- 데이터에 없는 뉴스·실적·수급은 추측하지 말고 "확인 필요"라고 쓴다.
-- 수익 보장, 단정적 표현("무조건", "확실히") 금지. 조건부로 말한다.
-- 사용자의 매수가가 주어지면 그 기준 수익률과 손익 관리 관점도 포함한다.
-- [사용자 계획]이 있으면 그 이름(A안·B안 등)과 가격·날짜를 그대로 인용해 계획 기준으로 답한다. [이벤트]가 있으면 일정 리스크로 반영한다.
-- 한국어, 모바일에서 읽기 쉽게 짧은 줄 위주로 쓴다. 표는 쓰지 않는다.`;
+const GEN_CONFIG = { temperature: 0.3, maxOutputTokens: 900 };
 
 // ---------------------------------------------------------------------
 // 사용자 계획 메모에서 가격·날짜 추출 → "사용자 계획" 사실로 붙임
@@ -757,45 +776,73 @@ function parsePlan(text, price) {
   return { prices, dates: [...new Set(dates)] };
 }
 
-function planBlock(plan, event, price) {
-  let s = '';
+// [사용자 계획] 블록: 메모 원문 + 추출한 가격·날짜 + (체크 시) 내 포지션
+function planSection(plan, position, price) {
+  const out = [];
   if (plan) {
+    out.push(plan);
     const p = parsePlan(plan, price);
-    s += `\n\n[사용자 계획]\n${plan}`;
     if (p.prices.length || p.dates.length) {
-      s += `\n사용자 계획의 가격·날짜(메모에서 추출, 그대로 인용): `;
-      s += [
+      out.push('사용자 계획의 가격·날짜(메모에서 추출, 그대로 인용): ' + [
         p.prices.length && `가격 ${p.prices.map((v) => `${won(v)}${price > 0 ? `(현재가 대비 ${sgn((v / price - 1) * 100, 1)})` : ''}`).join(', ')}`,
         p.dates.length && `날짜 ${p.dates.join(', ')}`,
-      ].filter(Boolean).join(' / ');
+      ].filter(Boolean).join(' / '));
     }
   }
-  if (event) s += `\n\n[이벤트]\n${event}`;
+  if (position) out.push(position);
+  return out.length ? out.join('\n') : '(없음)';
+}
+
+// 직전 2턴 요약: 질문 + 답의 '결론' 줄만
+function historySummary(turns) {
+  return turns.map((t) => {
+    const a = String(t.a || '');
+    const concl = (a.split('\n').find((l) => /결론/.test(l)) || a.split('\n').find((l) => l.trim()) || '')
+      .replace(/[*#]/g, '').trim().slice(0, 200);
+    return `- 질문: ${String(t.q || '').slice(0, 150)}\n  답의 결론: ${concl}`;
+  }).join('\n');
+}
+
+function buildAskMessage({ facts, plan, position, event, price, turns, question, focus }) {
+  let s = `[사실]\n${facts.map((l) => `- ${l}`).join('\n')}\n\n`;
+  s += `[사용자 계획]\n${planSection(plan, position, price)}\n\n`;
+  s += `[이벤트]\n${event || '(없음)'}\n\n`;
+  if (turns.length) s += `[이전 대화 요약]\n${historySummary(turns)}\n\n`;
+  s += `[질문]\n${question}`;
+  if (focus) s += `\n(이 질문의 강조점: ${focus})`;
   return s;
 }
 
 async function handleAsk(request, env, origin) {
   if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
   const body = await request.json().catch(() => ({}));
-  const question = String(body.question || '').trim().slice(0, 1000);
-  const context = String(body.context || '').slice(0, 20000);
+  const preset = PRESETS[body.preset] || null;
+  const question = (String(body.question || '').trim() || (preset ? preset.q : '')).slice(0, 1000);
   if (!question) return json({ error: '질문을 입력하세요' }, 400, origin);
-  if (!context) return json({ error: '차트 데이터가 없습니다' }, 400, origin);
-  const plan = String(body.plan || '').trim().slice(0, 1000);
-  const event = String(body.event || '').trim().slice(0, 1000);
-  const price = Number(body.price) || 0;
 
-  const history = (Array.isArray(body.history) ? body.history : [])
-    .slice(-8)
-    .filter((h) => h && h.text)
-    .map((h) => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: String(h.text).slice(0, 4000) }] }));
+  // [사실]: /chart가 준 판단 재료 문장. 없으면(계산 실패) 화면 요약 텍스트로 대신
+  let facts = (Array.isArray(body.facts) ? body.facts : []).map((l) => String(l).slice(0, 400)).slice(0, 40);
+  if (!facts.length && body.context) facts = String(body.context).slice(0, 6000).split('\n').filter((l) => l.trim());
+  if (!facts.length) return json({ error: '판단 재료가 없습니다. 차트를 다시 불러오세요' }, 400, origin);
 
-  const nowKst = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
+  const turns = (Array.isArray(body.turns) ? body.turns : []).slice(-2).filter((t) => t && t.q && t.a);
+  const sent = buildAskMessage({
+    facts,
+    plan: String(body.plan || '').trim().slice(0, 1000),
+    position: String(body.position || '').trim().slice(0, 300),
+    event: String(body.event || '').trim().slice(0, 1000),
+    price: Number(body.price) || 0,
+    turns,
+    question,
+    focus: preset ? preset.focus : '',
+  });
+
   const result = await callGemini(env, {
-    systemInstruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}${planBlock(plan, event, price)}` }] },
-    contents: [...history, { role: 'user', parts: [{ text: question }] }],
+    systemInstruction: { parts: [{ text: ADVISOR_PROMPT }] },
+    contents: [{ role: 'user', parts: [{ text: sent }] }],
+    generationConfig: GEN_CONFIG,
   }, request.cf?.colo);
-  return json(result, result.error ? 502 : 200, origin);
+  return json({ ...result, model: env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT, sent }, result.error ? 502 : 200, origin);
 }
 
 // ---------------------------------------------------------------------
