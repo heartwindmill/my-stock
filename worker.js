@@ -388,19 +388,31 @@ async function callGemini(env, payload, colo) {
     if (viaRelay) {
       // Apps Script는 POST 결과를 302로 googleusercontent.com에 넘겨주는데,
       // 그 주소는 GET으로만 열림. 자동 추적은 POST를 유지해 405가 나므로 직접 GET으로 따라감
-      let res = await fetch(env.RELAY_URL, {
+      // 오류 추적용 경로 표시: 호스트 + 마지막 경로만 (배포 ID·쿼리는 숨김)
+      const brief = (u) => {
+        try { const x = new URL(u); return `${x.host}/…/${x.pathname.split('/').filter(Boolean).pop() || ''}`; } catch { return '주소 형식 오류'; }
+      };
+      const relayUrl = String(env.RELAY_URL).trim();
+      let res = await fetch(relayUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ secret: env.RELAY_SECRET, model, payload }),
         redirect: 'manual',
       });
+      const trail = [`POST ${brief(relayUrl)} → ${res.status}`];
       for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400; hop++) {
         const next = res.headers.get('location');
         if (!next) break;
         res = await fetch(next, { method: 'GET', redirect: 'manual' });
+        trail.push(`GET ${brief(next)} → ${res.status}`);
       }
-      const r = await res.json().catch(() => null);
-      if (!r) return { error: `AI 중계 응답 실패 (${res.status}) [${where}] RELAY_URL이 '/exec'로 끝나는 웹 앱 주소인지, 액세스 권한이 '모든 사용자'인지 확인하세요` };
+      const raw = await res.text();
+      let r = null;
+      try { r = JSON.parse(raw); } catch { /* HTML 등 */ }
+      if (!r) {
+        const title = (raw.match(/<title>([^<]*)<\/title>/i) || [])[1] || '';
+        return { error: `AI 중계 응답 실패 [${where}] 경로: ${trail.join(' / ')}${title ? ` · 페이지 제목: ${title.slice(0, 80)}` : ''}` };
+      }
       if (r.error) return { error: `AI 중계 오류 (${r.status}) [${where}] ${String(r.error).slice(0, 200)}` };
       status = r.status;
       data = r.body || {};
