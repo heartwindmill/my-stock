@@ -729,7 +729,50 @@ const SWING_PROMPT = `너는 한국 주식·ETF 스윙 트레이딩(보유 기�
 - 데이터에 없는 뉴스·실적·수급은 추측하지 말고 "확인 필요"라고 쓴다.
 - 수익 보장, 단정적 표현("무조건", "확실히") 금지. 조건부로 말한다.
 - 사용자의 매수가가 주어지면 그 기준 수익률과 손익 관리 관점도 포함한다.
+- [사용자 계획]이 있으면 그 이름(A안·B안 등)과 가격·날짜를 그대로 인용해 계획 기준으로 답한다. [이벤트]가 있으면 일정 리스크로 반영한다.
 - 한국어, 모바일에서 읽기 쉽게 짧은 줄 위주로 쓴다. 표는 쓰지 않는다.`;
+
+// ---------------------------------------------------------------------
+// 사용자 계획 메모에서 가격·날짜 추출 → "사용자 계획" 사실로 붙임
+// - "1,150~1,180"처럼 천 원 단위로 줄여 쓴 값은 현재가와 비교해 ×1000
+// - "115만"은 ×10000. 현재가의 30%~300% 밖 숫자(퍼센트·횟수 등)는 가격으로 안 봄
+// ---------------------------------------------------------------------
+function parsePlan(text, price) {
+  const dates = [];
+  const dateRe = /(?<![\d.,])(1[0-2]|0?[1-9])\/(3[01]|[12]\d|0?[1-9])(?!\d)/g;
+  for (const m of text.matchAll(dateRe)) dates.push(`${+m[1]}/${+m[2]}`);
+  const rest = text.replace(dateRe, ' ');
+  const prices = [];
+  for (const m of rest.matchAll(/(\d[\d,]*(?:\.\d+)?)\s*(만)?/g)) {
+    let v = Number(m[1].replace(/,/g, ''));
+    if (!v) continue;
+    if (m[2]) v *= 10000;
+    if (price > 0) {
+      if (v < price / 50 && v * 1000 >= price * 0.3 && v * 1000 <= price * 3) v *= 1000;
+      if (v < price * 0.3 || v > price * 3) continue;
+    }
+    v = Math.round(v);
+    if (!prices.includes(v)) prices.push(v);
+  }
+  return { prices, dates: [...new Set(dates)] };
+}
+
+function planBlock(plan, event, price) {
+  let s = '';
+  if (plan) {
+    const p = parsePlan(plan, price);
+    s += `\n\n[사용자 계획]\n${plan}`;
+    if (p.prices.length || p.dates.length) {
+      s += `\n사용자 계획의 가격·날짜(메모에서 추출, 그대로 인용): `;
+      s += [
+        p.prices.length && `가격 ${p.prices.map((v) => `${won(v)}${price > 0 ? `(현재가 대비 ${sgn((v / price - 1) * 100, 1)})` : ''}`).join(', ')}`,
+        p.dates.length && `날짜 ${p.dates.join(', ')}`,
+      ].filter(Boolean).join(' / ');
+    }
+  }
+  if (event) s += `\n\n[이벤트]\n${event}`;
+  return s;
+}
 
 async function handleAsk(request, env, origin) {
   if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
@@ -738,6 +781,9 @@ async function handleAsk(request, env, origin) {
   const context = String(body.context || '').slice(0, 20000);
   if (!question) return json({ error: '질문을 입력하세요' }, 400, origin);
   if (!context) return json({ error: '차트 데이터가 없습니다' }, 400, origin);
+  const plan = String(body.plan || '').trim().slice(0, 1000);
+  const event = String(body.event || '').trim().slice(0, 1000);
+  const price = Number(body.price) || 0;
 
   const history = (Array.isArray(body.history) ? body.history : [])
     .slice(-8)
@@ -746,7 +792,7 @@ async function handleAsk(request, env, origin) {
 
   const nowKst = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
   const result = await callGemini(env, {
-    systemInstruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}` }] },
+    systemInstruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}${planBlock(plan, event, price)}` }] },
     contents: [...history, { role: 'user', parts: [{ text: question }] }],
   }, request.cf?.colo);
   return json(result, result.error ? 502 : 200, origin);

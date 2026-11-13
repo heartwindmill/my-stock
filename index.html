@@ -72,6 +72,10 @@
   .ask button { flex:0 0 72px; }
   .chk { display:flex; align-items:center; gap:8px; margin:10px 0 0; color:var(--sub); font-size:13px; }
   .chk input { width:auto; }
+  .memo { background:#0c1322; border:1px solid var(--line); padding:8px 12px; margin:8px 0 0; }
+  .memo summary { cursor:pointer; font-size:14px; }
+  .memo textarea { min-height:64px; font-family:inherit; font-size:14px; resize:vertical; }
+  .memo .saved { color:var(--sub); font-size:12px; font-weight:400; }
 </style>
 </head>
 <body>
@@ -145,7 +149,16 @@
         <button data-q="손절 기준을 어디로 잡아야 할까? 밴드 값 근거로 알려줘">손절 기준</button>
         <button data-q="일봉·60분봉 밴드폭이 수축(스퀴즈) 중이야? 돌파 방향 대응법을 알려줘">스퀴즈?</button>
       </div>
-      <div class="log" id="chatLog"></div>
+      <details class="memo" id="memoBox">
+        <summary>📝 내 계획·이벤트 메모 <span class="saved" id="memoState"></span></summary>
+        <label for="planMemo">내 계획 메모</label>
+        <textarea id="planMemo" placeholder="예: A안 일봉 중심선 종가 돌파 시 / B안 1,150~1,180 / 손절 종가 1,110,000 / 정찰 시한 11/24"></textarea>
+        <label for="eventMemo">이벤트 메모</label>
+        <textarea id="eventMemo" placeholder="예: 11/17 엔비디아 실적(미국 장 마감 후)"></textarea>
+        <div class="note">종목별로 이 폰에만 저장됩니다. 매수가·수량은 여기 적지 마세요 (아래 별도 체크로만 전송).</div>
+      </details>
+      <label class="chk"><input type="checkbox" id="sendPlan"> 계획·이벤트 함께 보내기</label>
+      <div class="log" id="chatLog" style="margin-top:10px"></div>
       <label class="chk" id="sendPosWrap" hidden><input type="checkbox" id="sendPos"> 내 매수가·손절가·익절가 함께 보내기</label>
       <div class="ask">
         <textarea id="q" placeholder="예: 내일 시가에 들어가도 될까?"></textarea>
@@ -395,6 +408,7 @@ async function openDetail(code) {
     renderChat();
   }
   cur.w = w;
+  loadMemos(code);
   $('sendPosWrap').hidden = !(w.buy || w.stop || w.target);
   $('sendPos').checked = store.get('sendPos', '0') === '1';
   await loadChart();
@@ -475,6 +489,23 @@ function buildContext() {
   return s;
 }
 
+// 종목별 계획·이벤트 메모 (localStorage, 폰마다 별도)
+function loadMemos(code) {
+  $('planMemo').value = store.get('plan:' + code, '');
+  $('eventMemo').value = store.get('event:' + code, '');
+  $('sendPlan').checked = store.get('sendPlan', '1') === '1'; // 기본 켜짐
+  memoState();
+}
+function memoState() {
+  const n = [$('planMemo').value.trim() && '계획', $('eventMemo').value.trim() && '이벤트'].filter(Boolean);
+  $('memoState').textContent = n.length ? `(${n.join('·')} 저장됨)` : '(비어 있음)';
+}
+function saveMemo(kind) {
+  if (!cur) return;
+  store.set(`${kind}:${cur.code}`, $(kind + 'Memo').value.slice(0, 1000));
+  memoState();
+}
+
 // 간단한 마크다운(**굵게**, 글머리표)만 표시
 function mdLite(text) {
   return esc(text)
@@ -508,7 +539,11 @@ async function ask(question) {
     const data = await call('/ask', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ question, history, context: buildContext() }),
+      body: JSON.stringify({
+        question, history, context: buildContext(),
+        price: cur.data.price,
+        ...($('sendPlan').checked ? { plan: $('planMemo').value.trim(), event: $('eventMemo').value.trim() } : {}),
+      }),
     });
     pending.text = data.text;
   } catch (e) {
@@ -541,6 +576,9 @@ $('quick').addEventListener('click', (e) => { const b = e.target.closest('button
 $('send').onclick = () => ask($('q').value);
 $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask($('q').value); } });
 $('sendPos').onchange = () => store.set('sendPos', $('sendPos').checked ? '1' : '0');
+$('sendPlan').onchange = () => store.set('sendPlan', $('sendPlan').checked ? '1' : '0');
+$('planMemo').addEventListener('input', () => saveMemo('plan'));
+$('eventMemo').addEventListener('input', () => saveMemo('event'));
 window.addEventListener('hashchange', route);
 
 $('save').onclick = () => {
