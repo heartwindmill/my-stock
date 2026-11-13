@@ -386,14 +386,21 @@ async function callGemini(env, payload, colo) {
   let data;
   try {
     if (viaRelay) {
-      const res = await fetch(env.RELAY_URL, {
+      // Apps Script는 POST 결과를 302로 googleusercontent.com에 넘겨주는데,
+      // 그 주소는 GET으로만 열림. 자동 추적은 POST를 유지해 405가 나므로 직접 GET으로 따라감
+      let res = await fetch(env.RELAY_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ secret: env.RELAY_SECRET, model, payload }),
-        redirect: 'follow', // Apps Script는 응답을 googleusercontent.com으로 넘겨줌
+        redirect: 'manual',
       });
+      for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400; hop++) {
+        const next = res.headers.get('location');
+        if (!next) break;
+        res = await fetch(next, { method: 'GET', redirect: 'manual' });
+      }
       const r = await res.json().catch(() => null);
-      if (!r) return { error: `AI 중계 응답 실패 (${res.status}) [${where}] Apps Script 배포의 액세스 권한이 '모든 사용자'인지 확인하세요` };
+      if (!r) return { error: `AI 중계 응답 실패 (${res.status}) [${where}] RELAY_URL이 '/exec'로 끝나는 웹 앱 주소인지, 액세스 권한이 '모든 사용자'인지 확인하세요` };
       if (r.error) return { error: `AI 중계 오류 (${r.status}) [${where}] ${String(r.error).slice(0, 200)}` };
       status = r.status;
       data = r.body || {};
