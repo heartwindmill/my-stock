@@ -3,7 +3,7 @@
 // - 한국투자증권(KIS) Open API로 국내 주식·ETF 시세(현재가·일봉·분봉)만 조회합니다.
 // - 주문·잔고·계좌 API는 일부러 넣지 않았습니다.
 // - 키는 코드에 없습니다. Cloudflare 대시보드의 Secret에서 읽습니다.
-// - 주소: GET /price, GET /chart, POST /analyze, POST /ask
+// - 주소: GET /price, GET /chart, GET /facts, POST /analyze, POST /ask
 //
 // 필요한 설정 (Settings → Variables and Secrets)
 //   KIS_ENV        (Text)   mock 또는 real
@@ -306,16 +306,13 @@ const forChart = (bars) => bars.map((b) => ({ t: toTs(b.d, b.hm), o: b.o, h: b.h
 // 상세 차트 데이터: 일봉(약 100거래일) + 60분봉(최근 7거래일, 1분봉을 모아 만듦)
 // 지난 날짜의 60분봉은 바뀌지 않으므로 KV에 저장해 재사용 (호출 수 절약)
 // ---------------------------------------------------------------------
-async function handleChart(request, env, origin) {
-  const code = (new URL(request.url).searchParams.get('code') || '').trim();
-  if (!/^[0-9A-Z]{6,7}$/.test(code)) return json({ error: '종목코드가 올바르지 않습니다' }, 400, origin);
-
+async function loadChartData(env, code) {
   const token = await getToken(env);
   const notes = [];
   const daily = await fetchDaily(env, token, code);
   const dates = daily.bars.map((b) => b.d);
   const lastDate = dates[dates.length - 1];
-  if (!lastDate) return json({ error: '일봉 데이터가 없습니다' }, 502, origin);
+  if (!lastDate) throw new Error('일봉 데이터가 없습니다');
   const now = kstNow();
 
   let m1 = [];
@@ -355,18 +352,266 @@ async function handleChart(request, env, origin) {
     notes.push('모의투자 서버는 지난 날짜 분봉을 주지 않아 60분봉이 오늘 것만 나옵니다. KIS_ENV를 real(실전 키)로 바꾸면 최근 7거래일 60분봉이 나옵니다.');
   }
 
+  return { code, name: daily.name, price: daily.price, change: daily.change, rate: daily.rate, daily: daily.bars, h60, notes };
+}
+
+function factsOrError(data) {
+  try {
+    return computeFacts(data);
+  } catch (e) {
+    return { error: `판단 재료 계산 실패: ${String(e.message || e).slice(0, 200)}`, lines: [], json: null };
+  }
+}
+
+async function handleChart(request, env, origin) {
+  const code = (new URL(request.url).searchParams.get('code') || '').trim();
+  if (!/^[0-9A-Z]{6,7}$/.test(code)) return json({ error: '종목코드가 올바르지 않습니다' }, 400, origin);
+  const data = await loadChartData(env, code);
   return json({
     mode: isReal(env) ? 'real' : 'mock',
     at: new Date().toISOString(),
     code,
-    name: daily.name,
-    price: daily.price,
-    change: daily.change,
-    rate: daily.rate,
-    daily: forChart(daily.bars),
-    h60: forChart(h60),
-    notes,
+    name: data.name,
+    price: data.price,
+    change: data.change,
+    rate: data.rate,
+    daily: forChart(data.daily),
+    h60: forChart(data.h60),
+    notes: data.notes,
+    facts: factsOrError(data),
   }, 200, origin);
+}
+
+// 판단 재료만 따로 조회 (확인·디버깅용)
+async function buildFactSheet(env, code) {
+  return factsOrError(await loadChartData(env, code));
+}
+
+async function handleFacts(request, env, origin) {
+  const code = (new URL(request.url).searchParams.get('code') || '').trim();
+  if (!/^[0-9A-Z]{6,7}$/.test(code)) return json({ error: '종목코드가 올바르지 않습니다' }, 400, origin);
+  return json({ at: new Date().toISOString(), code, facts: await buildFactSheet(env, code) }, 200, origin);
+}
+
+// =====================================================================
+// 판단 재료 (fact sheet) — AI가 숫자를 지어내지 않도록 코드가 미리 계산
+// 입력: loadChartData 결과 (daily·h60 봉: { d, hm, o, h, l, c, v }, 오래된 순)
+// 출력: { lines: [짧은 한국어 문장], json: {구조화 값} }
+// =====================================================================
+const WEEKDAY = ['일', '월', '화', '수', '목', '금', '토'];
+const won = (n) => `${Math.round(n).toLocaleString('en-US')}원`;
+const sgn = (x, digits = 1) => `${x > 0 ? '+' : ''}${x.toFixed(digits)}%`;
+const md = (d) => `${+d.slice(4, 6)}/${+d.slice(6, 8)}`;
+const ymdOf = (dt) => dt.toISOString().slice(0, 10).replace(/-/g, '');
+
+function bbSeries(bars, n = 20, k = 2) {
+  return bars.map((_, i) => {
+    if (i < n - 1) return null;
+    let s = 0;
+    for (let j = i - n + 1; j <= i; j++) s += bars[j].c;
+    const mid = s / n;
+    let v = 0;
+    for (let j = i - n + 1; j <= i; j++) v += (bars[j].c - mid) ** 2;
+    const sd = Math.sqrt(v / n);
+    return { mid, up: mid + k * sd, lo: mid - k * sd };
+  });
+}
+
+// 마지막 봉 기준 BB 요약. slopeTh: 중심선 '횡보'로 볼 3봉 변화율 기준(%)
+function bbSummary(bars, slopeTh) {
+  const bb = bbSeries(bars);
+  const i = bars.length - 1;
+  if (i < 0 || !bb[i]) return null;
+  const b = bb[i];
+  const c = bars[i].c;
+  const widthOf = (x) => ((x.up - x.lo) / x.mid) * 100;
+  const width = widthOf(b);
+  const ws = bb.slice(-20).filter(Boolean).map(widthOf);
+  const avgWidth = ws.reduce((a, x) => a + x, 0) / ws.length;
+  const state = width < avgWidth * 0.8 ? '수축' : width > avgWidth * 1.2 ? '확장' : '보통';
+  const p3 = bb[i - 3];
+  const slope3 = p3 ? (b.mid / p3.mid - 1) * 100 : 0;
+  const dir = slope3 > slopeTh ? '상승' : slope3 < -slopeTh ? '하락' : '횡보';
+  let upTouch = 0;
+  let loTouch = 0;
+  for (let j = Math.max(0, i - 9); j <= i; j++) {
+    if (!bb[j]) continue;
+    if (bars[j].h >= bb[j].up) upTouch++;
+    if (bars[j].l <= bb[j].lo) loTouch++;
+  }
+  return {
+    up: Math.round(b.up), mid: Math.round(b.mid), lo: Math.round(b.lo),
+    pctB: Math.round(((c - b.lo) / (b.up - b.lo)) * 100),
+    width: +width.toFixed(2), avgWidth: +avgWidth.toFixed(2), state,
+    slope3: +slope3.toFixed(2), dir, upTouch, loTouch,
+  };
+}
+
+function bbLine(title, s) {
+  if (!s) return `${title}: 봉이 20개 미만이라 계산 불가`;
+  return `${title}: 상단 ${won(s.up)} / 중심 ${won(s.mid)} / 하단 ${won(s.lo)} · %B ${s.pctB} · 밴드폭 ${s.width}%(20봉 평균 ${s.avgWidth}%, ${s.state}) · 중심선 3봉 ${sgn(s.slope3, 2)}(${s.dir}) · 최근 10봉 상단터치 ${s.upTouch}회, 하단터치 ${s.loTouch}회`;
+}
+
+// 기준 시각·장 상태·다음 거래일 (공휴일은 반영 못 함)
+function sessionInfo(lastDate) {
+  const now = kstNow();
+  const dt = new Date(Date.now() + KST_MS);
+  const wd = dt.getUTCDay();
+  const weekday = wd >= 1 && wd <= 5;
+  const tradedToday = lastDate === now.date;
+  let status;
+  if (!weekday) status = '휴장(주말)';
+  else if (now.hms < '090000') status = '장 시작 전';
+  else if (!tradedToday) status = '휴장 추정(오늘 시세 없음)';
+  else status = now.hms < '153000' ? '장중' : '장 마감';
+
+  let nd = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate()));
+  if (!(weekday && status === '장 시작 전')) {
+    do { nd = new Date(nd.getTime() + 86400000); } while (nd.getUTCDay() === 0 || nd.getUTCDay() === 6);
+  }
+  return {
+    date: now.date,
+    time: `${now.hms.slice(0, 2)}:${now.hms.slice(2, 4)}`,
+    weekday: WEEKDAY[wd],
+    status,
+    live: status === '장중',
+    tradedToday,
+    nextTradingDay: ymdOf(nd),
+    nextWeekday: WEEKDAY[nd.getUTCDay()],
+    isFriday: wd === 5,
+  };
+}
+
+// 일봉 스윙 고점·저점 (좌우 2봉보다 높/낮은 봉)
+function swingPoints(bars, lookback) {
+  const highs = [];
+  const lows = [];
+  const start = Math.max(2, bars.length - lookback);
+  for (let i = start; i < bars.length - 2; i++) {
+    const b = bars[i];
+    const nb = [bars[i - 2], bars[i - 1], bars[i + 1], bars[i + 2]];
+    if (nb.every((x) => b.h > x.h)) highs.push({ i, p: b.h, d: b.d });
+    if (nb.every((x) => b.l < x.l)) lows.push({ i, p: b.l, d: b.d });
+  }
+  return { highs, lows };
+}
+
+function computeFacts(data) {
+  const bars = data.daily;
+  const n = bars.length;
+  if (n < 2) throw new Error('일봉이 2개 미만');
+  const last = bars[n - 1];
+  const prev = bars[n - 2];
+  const ses = sessionInfo(last.d);
+  const price = data.price || last.c;
+  const prevClose = data.price ? data.price - data.change : prev.c;
+  const chgPct = (price / prevClose - 1) * 100;
+  const dayLabel = ses.tradedToday ? '당일' : `최근 거래일(${md(last.d)})`;
+  // 전일 = 마지막 봉의 직전 봉 (장 전·휴장이면 마지막 봉이 '최근 거래일')
+  const refPrev = ses.tradedToday ? prev : last;
+  const refPrevLabel = ses.tradedToday ? `전일(${md(prev.d)})` : `직전 거래일(${md(last.d)})`;
+
+  const daily = bbSummary(bars, 0.1);
+  const h60 = bbSummary(data.h60, 0.05);
+
+  // 최근 20일 평균 일중 변동폭 (진행 중인 오늘 봉 제외)
+  const done = ses.live ? bars.slice(0, -1) : bars;
+  const rng = [];
+  for (let j = Math.max(1, done.length - 20); j < done.length; j++) rng.push(((done[j].h - done[j].l) / done[j - 1].c) * 100);
+  const avgRange = rng.length ? rng.reduce((a, x) => a + x, 0) / rng.length : 0;
+
+  // 최근 20거래일 고점·저점
+  const last20 = bars.slice(-20);
+  const hi20 = last20.reduce((a, b) => (b.h > a.h ? b : a));
+  const lo20 = last20.reduce((a, b) => (b.l < a.l ? b : a));
+
+  // 돌파·이탈했던 선 재시험 (스윙 고·저점 기준)
+  const tol = Math.max(1, avgRange * 0.5); // 현재가가 선 근처로 볼 거리(%)
+  const { highs, lows } = swingPoints(bars, 60);
+  const tests = [];
+  for (const s of highs) {
+    const k = bars.findIndex((b, j) => j > s.i && b.c > s.p);
+    if (k < 0 || k >= n - 1) continue;
+    const maxAfter = Math.max(...bars.slice(k).map((b) => b.h));
+    if (maxAfter >= s.p * 1.02 && Math.abs(price / s.p - 1) * 100 <= tol) {
+      tests.push({ kind: 'support', p: s.p, d: s.d, text: `${won(s.p)}(${md(s.d)} 고점, 돌파했던 선) 시험 중 · 현재가 ${sgn((price / s.p - 1) * 100, 1)}` });
+    }
+  }
+  for (const s of lows) {
+    const k = bars.findIndex((b, j) => j > s.i && b.c < s.p);
+    if (k < 0 || k >= n - 1) continue;
+    const minAfter = Math.min(...bars.slice(k).map((b) => b.l));
+    if (minAfter <= s.p * 0.98 && Math.abs(price / s.p - 1) * 100 <= tol) {
+      tests.push({ kind: 'resistance', p: s.p, d: s.d, text: `${won(s.p)}(${md(s.d)} 저점, 이탈했던 선) 재시험 중 · 현재가 ${sgn((price / s.p - 1) * 100, 1)}` });
+    }
+  }
+  tests.sort((a, b) => Math.abs(price - a.p) - Math.abs(price - b.p));
+
+  // 지지·저항 후보 (BB 선 + 고·저점), 0.3% 이내는 하나로 합침
+  const cands = [];
+  const add = (p, label) => { if (p > 0) cands.push({ p: Math.round(p), label }); };
+  if (daily) { add(daily.up, '일봉 BB 상단'); add(daily.mid, '일봉 BB 중심'); add(daily.lo, '일봉 BB 하단'); }
+  if (h60) { add(h60.up, '60분봉 BB 상단'); add(h60.mid, '60분봉 BB 중심'); add(h60.lo, '60분봉 BB 하단'); }
+  add(hi20.h, `20일 고점(${md(hi20.d)})`);
+  add(lo20.l, `20일 저점(${md(lo20.d)})`);
+  add(refPrev.h, `${refPrevLabel} 고가`);
+  add(refPrev.l, `${refPrevLabel} 저가`);
+  for (const t of tests) add(t.p, `${md(t.d)} ${t.kind === 'support' ? '고점, 돌파했던 선' : '저점, 이탈했던 선'}`);
+  for (const s of highs) add(s.p, `${md(s.d)} 고점`);
+  for (const s of lows) add(s.p, `${md(s.d)} 저점`);
+  const pick = (list) => {
+    const out = [];
+    for (const c of list) {
+      const near = out.find((o) => Math.abs(o.p / c.p - 1) < 0.003);
+      if (near) { if (!near.label.includes(c.label)) near.label += `·${c.label}`; continue; }
+      if (out.length >= 2) break; // 2개 고른 뒤에도 바로 옆 가격대는 위에서 합쳐 넣음
+      out.push({ ...c });
+    }
+    return out.map((o) => ({ ...o, dist: +((o.p / price - 1) * 100).toFixed(2) }));
+  };
+  // 현재가와 같은 가격(시험 중인 선)은 지지로 봄
+  const resist = pick(cands.filter((c) => c.p > price).sort((a, b) => a.p - b.p));
+  const support = pick(cands.filter((c) => c.p <= price).sort((a, b) => b.p - a.p));
+
+  const headroom = resist[0] ? resist[0].dist : null;
+  const supportDist = support[0] ? -support[0].dist : null;
+  const narrowStop = supportDist !== null && avgRange > 0 && supportDist < avgRange / 2;
+
+  // ---- 문장 목록 ----
+  const L = [];
+  L.push(`기준 시각: ${md(ses.date)}(${ses.weekday}) ${ses.time} KST · ${ses.status} · 다음 거래일 ${md(ses.nextTradingDay)}(${ses.nextWeekday}) (공휴일 미반영)`);
+  L.push(`현재가 ${won(price)} · 전일 종가 ${won(prevClose)} 대비 ${sgn(chgPct, 1)}`);
+  L.push(`${dayLabel} 시가 ${won(last.o)} · 고가 ${won(last.h)} · 저가 ${won(last.l)}`);
+  L.push(bbLine('일봉 BB(20,2)', daily));
+  if (daily) L.push(`현재가는 일봉 중심선 ${price >= daily.mid ? '위' : '아래'} (중심선까지 ${sgn((daily.mid / price - 1) * 100, 1)})`);
+  L.push(bbLine('60분봉 BB(20,2)', h60));
+  L.push(`최근 20거래일 고점 ${won(hi20.h)}(${md(hi20.d)}) · 저점 ${won(lo20.l)}(${md(lo20.d)})`);
+  L.push(`${refPrevLabel} 고가 ${won(refPrev.h)} · 저가 ${won(refPrev.l)}`);
+  for (const t of tests.slice(0, 2)) L.push(t.text);
+  L.push(`위 저항: ${resist.length ? resist.map((r) => `${won(r.p)}(${r.label}, ${sgn(r.dist, 1)})`).join(' / ') : '가까운 저항 없음(신고가 구간)'}`);
+  L.push(`아래 지지: ${support.length ? support.map((s) => `${won(s.p)}(${s.label}, ${sgn(s.dist, 1)})`).join(' / ') : '가까운 지지 없음'}`);
+  L.push(`다음 저항까지 헤드룸 ${headroom === null ? '없음' : sgn(headroom, 1)} · 가장 가까운 지지까지 ${supportDist === null ? '없음' : `-${supportDist.toFixed(1)}%`}`);
+  L.push(`최근 20일 평균 일중 변동폭 ${avgRange.toFixed(1)}%`);
+  if (narrowStop) L.push(`⚠ 손절 폭이 변동성 대비 좁음: 가장 가까운 지지 ${won(support[0].p)}까지 -${supportDist.toFixed(1)}%로 평균 일중 변동폭(${avgRange.toFixed(1)}%)의 절반보다 작아, 그 바로 아래 손절은 노이즈에 걸리기 쉬움`);
+  if (ses.isFriday) L.push('⚠ 금요일: 주말 보유 리스크(월요일 갭 가능)');
+  if (!h60) L.push('참고: 60분봉이 20개 미만이라 60분봉 BB 없음');
+
+  return {
+    lines: L,
+    json: {
+      session: ses,
+      price, prevClose, changePct: +chgPct.toFixed(2),
+      day: { label: dayLabel, date: last.d, o: last.o, h: last.h, l: last.l },
+      prevDay: { date: refPrev.d, h: refPrev.h, l: refPrev.l },
+      daily, h60,
+      high20: { p: hi20.h, d: hi20.d }, low20: { p: lo20.l, d: lo20.d },
+      retests: tests.map(({ text, ...r }) => r),
+      resistance: resist, support,
+      headroomPct: headroom, supportDistPct: supportDist,
+      avgRangePct: +avgRange.toFixed(2),
+      flags: { narrowStop, weekendRisk: ses.isFriday },
+    },
+  };
 }
 
 // ---------------------------------------------------------------------
@@ -531,6 +776,7 @@ export default {
     try {
       if (request.method === 'GET' && pathname === '/price') return await handlePrice(request, env, origin);
       if (request.method === 'GET' && pathname === '/chart') return await handleChart(request, env, origin);
+      if (request.method === 'GET' && pathname === '/facts') return await handleFacts(request, env, origin);
       if (request.method === 'POST' && pathname === '/analyze') return await handleAnalyze(request, env, origin);
       if (request.method === 'POST' && pathname === '/ask') return await handleAsk(request, env, origin);
       return json({ error: '없는 주소입니다' }, 404, origin);

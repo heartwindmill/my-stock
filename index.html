@@ -63,6 +63,10 @@
   .msg.user { align-self:flex-end; background:#3a2a1f; max-width:85%; }
   .msg.model { background:#0c1322; border:1px solid var(--line); }
   .msg.error { background:#3a1c22; color:#ffb3b3; }
+  .facts summary { cursor:pointer; }
+  .facts ul { margin:10px 0 0; padding-left:18px; font-size:13px; line-height:1.55; }
+  .facts li { margin-bottom:4px; word-break:keep-all; overflow-wrap:anywhere; }
+  .facts li.warn { color:#ffd27a; }
   .ask { display:flex; gap:8px; margin-top:10px; align-items:flex-end; }
   .ask textarea { min-height:44px; height:44px; font-family:inherit; font-size:14px; resize:vertical; }
   .ask button { flex:0 0 72px; }
@@ -126,6 +130,11 @@
       <div class="chart small" id="c1"></div>
       <div class="stats" id="st1"></div>
     </div>
+
+    <details class="card facts" id="factsBox" hidden>
+      <summary><b>📋 판단 재료</b> <span class="note" style="margin:0">코드가 미리 계산한 숫자 (AI는 이것만 인용)</span></summary>
+      <ul id="factsList"></ul>
+    </details>
 
     <div class="card chat">
       <div class="row1"><b>🤖 AI에게 묻기</b><span class="note" style="margin:0">스윙 관점 · 현재 차트 숫자 기반</span></div>
@@ -382,6 +391,7 @@ async function openDetail(code) {
     ['lg60', 'lg1', 'st60', 'st1'].forEach((id) => { $(id).innerHTML = ''; });
     $('c60').innerHTML = '<div class="loading">차트 불러오는 중… (처음엔 10초쯤 걸릴 수 있어요)</div>';
     $('c1').innerHTML = '';
+    $('factsBox').hidden = true;
     renderChat();
   }
   cur.w = w;
@@ -433,6 +443,14 @@ function renderDetail() {
   drawChart('c1', $('c1'), data.daily, cur.bbD, lines, 80, false);
   $('lg60').innerHTML = legendHtml(cur.st60); $('st60').innerHTML = statChips(cur.st60);
   $('lg1').innerHTML = legendHtml(cur.stD);   $('st1').innerHTML = statChips(cur.stD);
+
+  const f = data.facts;
+  $('factsBox').hidden = !f;
+  if (f) {
+    $('factsList').innerHTML = f.error
+      ? `<li class="warn">${esc(f.error)}</li>`
+      : f.lines.map((l) => `<li${l.startsWith('⚠') ? ' class="warn"' : ''}>${esc(l)}</li>`).join('');
+  }
 }
 
 // AI에게 보낼 차트 요약 (숫자만, 보유 수량·금액은 없음)
