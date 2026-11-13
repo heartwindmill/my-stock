@@ -63,6 +63,7 @@
   .msg.user { align-self:flex-end; background:#3a2a1f; max-width:85%; }
   .msg.model { background:#0c1322; border:1px solid var(--line); }
   .msg.error { background:#3a1c22; color:#ffb3b3; }
+  .warnLine { background:#4a3a14; color:#ffd27a; border-radius:8px; padding:6px 8px; margin-bottom:8px; font-size:13px; white-space:normal; }
   .mdt { border-collapse:collapse; width:100%; margin:4px 0; font-size:13px; white-space:normal; }
   .mdt td { border:1px solid var(--line); padding:4px 6px; vertical-align:top; }
   .mdt tr:first-child td { color:var(--sub); font-weight:700; }
@@ -544,7 +545,7 @@ function positionLine() {
 function renderChat() {
   const list = chats[cur.code] || [];
   $('chatLog').innerHTML = list.map((m) =>
-    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}</div>`).join('');
+    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${(m.warnings || []).map((w) => `<div class="warnLine">${esc(w)}</div>`).join('')}${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}</div>`).join('');
 }
 
 async function ask(question, preset) {
@@ -581,6 +582,7 @@ async function ask(question, preset) {
       }),
     });
     pending.text = data.text;
+    pending.warnings = data.warnings || [];
   } catch (e) {
     pending.text = e.message; pending.error = true;
   } finally {

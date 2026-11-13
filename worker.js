@@ -676,12 +676,12 @@ async function callGemini(env, payload, colo) {
 
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
   if (!text) {
-    if (status === 429) return { error: `무료 한도 초과입니다. 잠시 후 다시 시도하세요. [${where}]` };
+    if (status === 429) return { error: `무료 한도 초과입니다. 잠시 후 다시 시도하세요. [${where}]`, rateLimited: true };
     // Gemini가 준 오류 설명을 함께 보여줌 (키 값은 포함되지 않음)
     const why = data?.error?.message || data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || '';
     return { error: `AI 응답 실패 (${status}) [${model} · ${where}] ${String(why).slice(0, 300)}`.trim() };
   }
-  return { text };
+  return { text, finishReason: data?.candidates?.[0]?.finishReason || '' };
 }
 
 // ---------------------------------------------------------------------
@@ -813,6 +813,62 @@ function buildAskMessage({ facts, plan, position, event, price, turns, question,
   return s;
 }
 
+// =====================================================================
+// 답변 검증·자동 보정 (작은 모델 보완)
+// 1) 5개 제목 + 고지 문구  2) 가격 숫자가 [사실]·계획 숫자와 ±0.5% 이내  3) 금지 표현
+// =====================================================================
+const DISCLAIMER = '참고용 정보이며 투자 판단과 책임은 본인에게 있습니다.';
+const HEADINGS = ['결론', '화면 확인', '판단 근거', '종가 조건별 다음 계획', '반대 근거'];
+const BANNED = [
+  [/무조건/, '무조건'],
+  [/반드시\s*(오른|오를|상승|떨어|하락|반등)/, '반드시 오른다/떨어진다'],
+  [/지금\s*(사세요|매수하세요|사라|파세요|매도하세요|팔아라)/, '지금 사세요/파세요'],
+  [/(?<!불)확실/, '확실'],
+];
+
+// 가벼운 제목 오타와 '(기준시각)' 자리표시를 코드가 직접 고침
+function normalizeAnswer(text, facts) {
+  let t = String(text).replace(/\r/g, '');
+  t = t.replace(/^([^\S\n]*[#*]*[^\S\n]*)종.{0,2}[^\S\n]*조건별[^\S\n]*(?:다음[^\S\n]*)?계획/gm, '$1종가 조건별 다음 계획');
+  t = t.replace(/^([^\S\n]*[#*]*[^\S\n]*)반대[^\S\n]*근거/gm, '$1반대 근거');
+  const m = String(facts[0] || '').match(/기준 시각:\s*([^·]+?KST)/);
+  if (m) t = t.replace(/\(\s*기준\s*시각\s*\)/g, `(${m[1].trim()})`);
+  return t;
+}
+
+// 텍스트 안의 가격 숫자 (콤마 숫자, '원'·'만원'이 붙은 숫자). 천 원 단위 줄임 표기는 현재가 기준으로 보정
+function pricesIn(text, price, strict) {
+  const out = [];
+  const re = /(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(\s*만)?(\s*원)?(\s*%)?/g;
+  for (const m of String(text).matchAll(re)) {
+    if (m[4]) continue; // 퍼센트
+    const hasComma = m[1].includes(',');
+    if (!hasComma && !m[2] && !m[3]) continue; // 날짜·횟수 등
+    let v = Number(m[1].replace(/,/g, ''));
+    if (!v) continue;
+    if (m[2]) v *= 10000;
+    if (price > 0 && v < price / 50 && v * 1000 >= price * 0.3 && v * 1000 <= price * 3) v *= 1000;
+    if (strict && price > 0 && !m[3] && (v < price * 0.3 || v > price * 3)) continue; // 원 표기 없는 큰 숫자는 가격 범위만
+    out.push(Math.round(v));
+  }
+  return out;
+}
+
+function validateAnswer(text, allowed, price) {
+  const problems = [];
+  for (const h of HEADINGS) {
+    if (!new RegExp(`^[^\\S\\n]*[#*•-]*[^\\S\\n]*\\**${h}`, 'm').test(text)) problems.push(`'${h}' 제목이 없음`);
+  }
+  const wrong = [...new Set(pricesIn(text, price, true))].filter((v) => !allowed.some((a) => Math.abs(v / a - 1) <= 0.005));
+  if (wrong.length) problems.push(`[사실]·사용자 계획에 없는 가격: ${wrong.slice(0, 6).map(won).join(', ')}`);
+  for (const [re, label] of BANNED) if (re.test(text)) problems.push(`금지 표현 '${label}' 사용`);
+  return { problems, wrong };
+}
+
+function withDisclaimer(text) {
+  return text.includes('투자 판단과 책임은 본인에게') ? text : `${text.trimEnd()}\n\n${DISCLAIMER}`;
+}
+
 async function handleAsk(request, env, origin) {
   if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
   const body = await request.json().catch(() => ({}));
@@ -826,23 +882,62 @@ async function handleAsk(request, env, origin) {
   if (!facts.length) return json({ error: '판단 재료가 없습니다. 차트를 다시 불러오세요' }, 400, origin);
 
   const turns = (Array.isArray(body.turns) ? body.turns : []).slice(-2).filter((t) => t && t.q && t.a);
-  const sent = buildAskMessage({
-    facts,
-    plan: String(body.plan || '').trim().slice(0, 1000),
-    position: String(body.position || '').trim().slice(0, 300),
-    event: String(body.event || '').trim().slice(0, 1000),
-    price: Number(body.price) || 0,
-    turns,
-    question,
-    focus: preset ? preset.focus : '',
-  });
+  const plan = String(body.plan || '').trim().slice(0, 1000);
+  const position = String(body.position || '').trim().slice(0, 300);
+  const event = String(body.event || '').trim().slice(0, 1000);
+  const price = Number(body.price) || 0;
+  const sent = buildAskMessage({ facts, plan, position, event, price, turns, question, focus: preset ? preset.focus : '' });
+  const model = env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  const colo = request.cf?.colo;
 
-  const result = await callGemini(env, {
+  // 대조용 허용 가격: [사실]·계획·포지션·이벤트에 나온 모든 가격 숫자
+  const allowed = [...new Set([
+    ...pricesIn(facts.join('\n'), price, false),
+    ...parsePlan(plan, price).prices,
+    ...pricesIn(`${plan}\n${position}\n${event}`, price, false),
+    ...(price ? [price] : []),
+  ])].filter((v) => v > 0);
+
+  const base = {
     systemInstruction: { parts: [{ text: ADVISOR_PROMPT }] },
-    contents: [{ role: 'user', parts: [{ text: sent }] }],
     generationConfig: GEN_CONFIG,
-  }, request.cf?.colo);
-  return json({ ...result, model: env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT, sent }, result.error ? 502 : 200, origin);
+  };
+  const first = await callGemini(env, { ...base, contents: [{ role: 'user', parts: [{ text: sent }] }] }, colo);
+  if (first.error) return json({ ...first, model, sent, retries: 0 }, first.rateLimited ? 429 : 502, origin);
+
+  let answer = normalizeAnswer(first.text, facts);
+  let check = validateAnswer(answer, allowed, price);
+  if (first.finishReason === 'MAX_TOKENS') check.problems.push('답이 길어 중간에 잘림 (더 짧게)');
+  let retries = 0;
+
+  // 문제 있으면 1회만 재요청 (질문당 Gemini 호출 최대 2회)
+  if (check.problems.length) {
+    retries = 1;
+    const fix = `다음 문제를 고쳐 같은 형식으로 다시 써라: ${check.problems.join(' / ')}\n가격은 반드시 [사실]과 [사용자 계획]에 있는 숫자만 그대로 쓸 것.`;
+    const second = await callGemini(env, {
+      ...base,
+      contents: [
+        { role: 'user', parts: [{ text: sent }] },
+        { role: 'model', parts: [{ text: first.text }] },
+        { role: 'user', parts: [{ text: fix }] },
+      ],
+    }, colo);
+    if (!second.error) {
+      const a2 = normalizeAnswer(second.text, facts);
+      const c2 = validateAnswer(a2, allowed, price);
+      if (second.finishReason === 'MAX_TOKENS') c2.problems.push('답이 길어 중간에 잘림');
+      if (c2.problems.length <= check.problems.length) { answer = a2; check = c2; }
+    } else if (second.rateLimited) {
+      check.problems.push('재검토 요청이 무료 한도에 걸림 (첫 답변 표시)');
+    }
+  }
+
+  const warnings = [];
+  if (check.wrong.length) warnings.push(`⚠ 일부 수치가 원자료와 다릅니다: ${check.wrong.slice(0, 6).map(won).join(', ')}`);
+  const other = check.problems.filter((p) => !p.startsWith('[사실]'));
+  if (other.length) warnings.push(`⚠ 형식 검사 미통과: ${other.join(' / ')}`);
+
+  return json({ text: withDisclaimer(answer), model, sent, retries, warnings }, 200, origin);
 }
 
 // ---------------------------------------------------------------------
