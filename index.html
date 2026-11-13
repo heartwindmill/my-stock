@@ -63,6 +63,8 @@
   .msg.user { align-self:flex-end; background:#3a2a1f; max-width:85%; }
   .msg.model { background:#0c1322; border:1px solid var(--line); }
   .msg.error { background:#3a1c22; color:#ffb3b3; }
+  .ansMeta { color:var(--sub); font-size:11px; margin-top:8px; border-top:1px solid var(--line); padding-top:6px; white-space:normal; }
+  .sent { white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.5; color:var(--text); margin:8px 0 0; max-height:360px; overflow:auto; }
   .warnLine { background:#4a3a14; color:#ffd27a; border-radius:8px; padding:6px 8px; margin-bottom:8px; font-size:13px; white-space:normal; }
   .mdt { border-collapse:collapse; width:100%; margin:4px 0; font-size:13px; white-space:normal; }
   .mdt td { border:1px solid var(--line); padding:4px 6px; vertical-align:top; }
@@ -164,6 +166,10 @@
       <label class="chk"><input type="checkbox" id="sendPlan"> 계획·이벤트 함께 보내기</label>
       <div class="log" id="chatLog" style="margin-top:10px"></div>
       <label class="chk" id="sendPosWrap" hidden><input type="checkbox" id="sendPos"> 내 매수가·손절가·익절가 함께 보내기</label>
+      <details class="memo" id="sentBox" hidden>
+        <summary>🔎 보낸 데이터 보기 <span class="saved">(마지막 질문 때 AI에 실제 전송한 전문, 키·PIN 없음)</span></summary>
+        <pre class="sent" id="sentText"></pre>
+      </details>
       <div class="ask">
         <textarea id="q" placeholder="예: 내일 시가에 들어가도 될까?"></textarea>
         <button id="send" class="primary">전송</button>
@@ -545,7 +551,10 @@ function positionLine() {
 function renderChat() {
   const list = chats[cur.code] || [];
   $('chatLog').innerHTML = list.map((m) =>
-    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${(m.warnings || []).map((w) => `<div class="warnLine">${esc(w)}</div>`).join('')}${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}</div>`).join('');
+    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${(m.warnings || []).map((w) => `<div class="warnLine">${esc(w)}</div>`).join('')}${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}${m.meta ? `<div class="ansMeta">${esc(m.meta)}</div>` : ''}</div>`).join('');
+  const last = [...list].reverse().find((m) => m.sent);
+  $('sentBox').hidden = !last;
+  $('sentText').textContent = last ? last.sent : '';
 }
 
 async function ask(question, preset) {
@@ -583,6 +592,9 @@ async function ask(question, preset) {
     });
     pending.text = data.text;
     pending.warnings = data.warnings || [];
+    pending.sent = data.sent || '';
+    const asOf = ((facts[0] || '').match(/기준 시각:\s*([^·]+?KST)/) || [])[1];
+    pending.meta = [`모델: ${data.model || '?'}`, `재요청 ${data.retries || 0}회`, asOf && `기준시각 ${asOf.trim()}`].filter(Boolean).join(' · ');
   } catch (e) {
     pending.text = e.message; pending.error = true;
   } finally {
