@@ -33,9 +33,25 @@ Settings → Pages → Source: **Deploy from a branch**, Branch: **main / (root)
 | `KIS_APP_KEY` | **Secret** | 모의투자 APP KEY |
 | `KIS_APP_SECRET` | **Secret** | 모의투자 APP SECRET |
 | `ACCESS_PIN` | **Secret** | 내가 정한 숫자 6자리 |
-| `GEMINI_API_KEY` | **Secret** | 제미나이 키 (AI 분석용, 선택) |
+| `RELAY_URL` | **Secret** | Apps Script 중계 웹앱 주소 (아래 5-1) |
+| `RELAY_SECRET` | **Secret** | 중계 공유 비밀값 (Apps Script와 같은 값) |
+| `GEMINI_API_KEY` | **Secret** | 선택. `RELAY_URL`이 없을 때만 Gemini 직접 호출에 사용 |
 
 키는 채팅창·메모·GitHub에 넣지 말고 여기에만 직접 입력.
+
+### 5-1. AI 중계(Apps Script) 만들기
+Worker가 홍콩 등에서 실행되면 Gemini가 `User location is not supported`로 막습니다. Google 서버(Apps Script)가 대신 호출하게 합니다.
+1. script.google.com → **새 프로젝트** → 이름 `gemini-relay`
+2. `Code.gs` 내용을 지우고 저장소의 `apps-script/gemini-relay.gs` 내용 붙여넣기 → 저장
+3. 왼쪽 ⚙️ **프로젝트 설정 → 스크립트 속성 → 속성 추가**
+   - `GEMINI_API_KEY` = 제미나이 키
+   - `RELAY_SECRET` = 긴 무작위 문자열 (30자 이상 권장, 영문·숫자)
+4. 오른쪽 위 **배포 → 새 배포** → 유형 ⚙️ **웹 앱**
+   - 실행 사용자: **나**, 액세스 권한: **모든 사용자** → 배포 → 권한 승인
+5. 나온 **웹 앱 URL**(`https://script.google.com/macros/s/…/exec`)을 Worker Secret `RELAY_URL`에, 같은 비밀값을 `RELAY_SECRET`에 입력 → Deploy
+6. 브라우저로 웹 앱 URL을 열어 `{"ok":true}`가 보이면 배포 정상
+- `gemini-relay.gs`를 고친 뒤에는 **배포 → 배포 관리 → ✏️ → 버전: 새 버전 → 배포** (주소 유지)
+- AI 오류 메시지 끝의 `[중계 · colo XXX]`는 Worker가 실행된 지역 코드입니다 (원인 추적용)
 
 ### 6. 폰에서 사용
 1. `https://heartwindmill.github.io/my-stock/` 접속

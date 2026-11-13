@@ -10,7 +10,9 @@
 //   KIS_APP_KEY    (Secret) 한국투자증권 APP KEY
 //   KIS_APP_SECRET (Secret) 한국투자증권 APP SECRET
 //   ACCESS_PIN     (Secret) 내가 정한 접속 PIN (예: 숫자 6자리)
-//   GEMINI_API_KEY (Secret) 선택. AI 분석·AI 질문용
+//   RELAY_URL      (Secret) AI용. Apps Script 웹앱 주소 (apps-script/gemini-relay.gs)
+//   RELAY_SECRET   (Secret) AI용. Apps Script 스크립트 속성 RELAY_SECRET과 같은 값
+//   GEMINI_API_KEY (Secret) 선택. RELAY_URL이 없을 때만 Gemini를 직접 호출 (지역 차단될 수 있음)
 //   GEMINI_MODEL   (Text)   선택. 비우면 아래 GEMINI_MODEL_DEFAULT
 // 필요한 바인딩 (Settings → Bindings → KV namespace)
 //   TOKEN_KV  : 접근토큰 재사용 + 지난 날짜 60분봉 저장소
@@ -369,21 +371,51 @@ async function handleChart(request, env, origin) {
 
 // ---------------------------------------------------------------------
 // Gemini 호출 공통
+// - RELAY_URL이 있으면 Apps Script 중계로 호출 (Worker 실행 지역과 무관)
+// - 없으면 예전처럼 직접 호출 (홍콩 등에서 "User location is not supported" 가능)
+// - 오류 메시지에 Worker 실행 위치(colo)를 붙여 원인 추적
 // ---------------------------------------------------------------------
-async function callGemini(env, payload) {
+const aiReady = (env) => Boolean((env.RELAY_URL && env.RELAY_SECRET) || env.GEMINI_API_KEY);
+const AI_NOT_READY = 'AI 설정이 없습니다 (RELAY_URL·RELAY_SECRET을 설정하세요)';
+
+async function callGemini(env, payload, colo) {
   const model = env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json().catch(() => ({}));
+  const viaRelay = Boolean(env.RELAY_URL && env.RELAY_SECRET);
+  const where = `${viaRelay ? '중계' : '직접'} · colo ${colo || '?'}`;
+  let status;
+  let data;
+  try {
+    if (viaRelay) {
+      const res = await fetch(env.RELAY_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ secret: env.RELAY_SECRET, model, payload }),
+        redirect: 'follow', // Apps Script는 응답을 googleusercontent.com으로 넘겨줌
+      });
+      const r = await res.json().catch(() => null);
+      if (!r) return { error: `AI 중계 응답 실패 (${res.status}) [${where}] Apps Script 배포의 액세스 권한이 '모든 사용자'인지 확인하세요` };
+      if (r.error) return { error: `AI 중계 오류 (${r.status}) [${where}] ${String(r.error).slice(0, 200)}` };
+      status = r.status;
+      data = r.body || {};
+    } else {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+        body: JSON.stringify(payload),
+      });
+      status = res.status;
+      data = await res.json().catch(() => ({}));
+    }
+  } catch (e) {
+    return { error: `AI 연결 실패 [${where}] ${String(e.message || e).slice(0, 200)}` };
+  }
+
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
   if (!text) {
-    if (res.status === 429) return { error: '무료 한도 초과입니다. 잠시 후 다시 시도하세요.' };
+    if (status === 429) return { error: `무료 한도 초과입니다. 잠시 후 다시 시도하세요. [${where}]` };
     // Gemini가 준 오류 설명을 함께 보여줌 (키 값은 포함되지 않음)
     const why = data?.error?.message || data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || '';
-    return { error: `AI 응답 실패 (${res.status}) [${model}] ${String(why).slice(0, 300)}`.trim() };
+    return { error: `AI 응답 실패 (${status}) [${model} · ${where}] ${String(why).slice(0, 300)}`.trim() };
   }
   return { text };
 }
@@ -392,7 +424,7 @@ async function callGemini(env, payload) {
 // AI 분석 (목록 화면) — 시세 숫자만 보냄. 보유 수량·금액은 보내지 않음
 // ---------------------------------------------------------------------
 async function handleAnalyze(request, env, origin) {
-  if (!env.GEMINI_API_KEY) return json({ error: 'GEMINI_API_KEY가 설정되지 않았습니다' }, 400, origin);
+  if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
   const body = await request.json().catch(() => ({}));
   const items = Array.isArray(body.items) ? body.items.slice(0, MAX_CODES) : [];
   if (items.length === 0) return json({ error: '분석할 시세가 없습니다' }, 400, origin);
@@ -410,7 +442,7 @@ ${lines}
 3) 오늘 점검 필요 여부 (필요/불필요 + 이유 1줄)
 규칙: 매수·매도 지시나 수익 보장 표현 금지. 확실하지 않은 원인(뉴스 등)은 추측하지 말고 "확인 필요"라고 쓸 것. 연금 계좌는 장기 분산 관점을 유지할 것.`;
 
-  const result = await callGemini(env, { contents: [{ role: 'user', parts: [{ text: prompt }] }] });
+  const result = await callGemini(env, { contents: [{ role: 'user', parts: [{ text: prompt }] }] }, request.cf?.colo);
   return json(result, result.error ? 502 : 200, origin);
 }
 
@@ -436,7 +468,7 @@ const SWING_PROMPT = `너는 한국 주식·ETF 스윙 트레이딩(보유 기�
 - 한국어, 모바일에서 읽기 쉽게 짧은 줄 위주로 쓴다. 표는 쓰지 않는다.`;
 
 async function handleAsk(request, env, origin) {
-  if (!env.GEMINI_API_KEY) return json({ error: 'GEMINI_API_KEY가 설정되지 않았습니다' }, 400, origin);
+  if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
   const body = await request.json().catch(() => ({}));
   const question = String(body.question || '').trim().slice(0, 1000);
   const context = String(body.context || '').slice(0, 20000);
@@ -452,7 +484,7 @@ async function handleAsk(request, env, origin) {
   const result = await callGemini(env, {
     systemInstruction: { parts: [{ text: `${SWING_PROMPT}\n\n[차트 데이터] (질문 시각 ${nowKst} KST)\n${context}` }] },
     contents: [...history, { role: 'user', parts: [{ text: question }] }],
-  });
+  }, request.cf?.colo);
   return json(result, result.error ? 502 : 200, origin);
 }
 
