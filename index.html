@@ -82,10 +82,11 @@
   .memo summary { cursor:pointer; font-size:14px; }
   .memo textarea { min-height:64px; font-family:inherit; font-size:14px; resize:vertical; }
   .memo .saved { color:var(--sub); font-size:12px; font-weight:400; }
-  .posGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }
-  .posGrid label { margin:0; font-size:12px; }
-  .posGrid input { margin-top:4px; padding:8px 10px; font-size:16px; font-weight:700; }
-  .posGrid label.sell { color:var(--up); } .posGrid label.stop { color:var(--down); }
+  .posGrid { display:grid; grid-template-columns:repeat(6, 1fr); gap:8px; margin-top:10px; }
+  .posGrid label { margin:0; font-size:12px; grid-column:span 2; min-width:0; }
+  .posGrid label.half { grid-column:span 3; }
+  .posGrid input { margin-top:4px; padding:8px; font-size:15px; font-weight:700; }
+  .posGrid label.entry { color:#7fd99a; } .posGrid label.sell { color:var(--up); } .posGrid label.stop { color:var(--down); }
   .pickBtn { margin-top:8px; padding:8px 10px; font-size:13px; font-weight:600; border-radius:10px; width:100%; background:#2a3a24; color:#cfe8c0; }
 </style>
 </head>
@@ -132,10 +133,11 @@
     <div class="card">
       <div class="row1"><span class="price" id="dPrice">-</span><span id="dChg"></span></div>
       <div class="posGrid">
-        <label>매수 평균가<input id="pBuy" inputmode="numeric" placeholder="원" autocomplete="off"></label>
-        <label>매수 수량<input id="pQty" inputmode="numeric" placeholder="주" autocomplete="off"></label>
-        <label class="sell">매도 목표가<input id="pTarget" inputmode="numeric" placeholder="AI 추천 매도가" autocomplete="off"></label>
-        <label class="stop">손절가<input id="pStop" inputmode="numeric" placeholder="AI 추천 손절가" autocomplete="off"></label>
+        <label class="half">매수 평균가<input id="pBuy" inputmode="numeric" placeholder="원" autocomplete="off"></label>
+        <label class="half">매수 수량<input id="pQty" inputmode="numeric" placeholder="주" autocomplete="off"></label>
+        <label class="entry">매수 목표가<input id="pEntry" inputmode="numeric" placeholder="AI 추천" autocomplete="off"></label>
+        <label class="sell">매도 목표가<input id="pTarget" inputmode="numeric" placeholder="AI 추천" autocomplete="off"></label>
+        <label class="stop">손절가<input id="pStop" inputmode="numeric" placeholder="AI 추천" autocomplete="off"></label>
       </div>
       <div class="row2" id="dPos"></div>
       <div class="note" style="margin-top:6px">이 폰에만 저장됩니다. 수량은 AI에 보내지 않습니다.</div>
@@ -226,7 +228,9 @@ function posOf(code) {
 }
 const getWatch = () => parseWatch(store.get('watch', DEFAULT_WATCH)).map((w) => {
   const p = posOf(w.code);
-  return p ? { ...w, buy: +p.buy || 0, qty: +p.qty || 0, target: +p.target || 0, stop: +p.stop || 0 } : { ...w, qty: 0 };
+  return p
+    ? { ...w, buy: +p.buy || 0, qty: +p.qty || 0, entry: +p.entry || 0, target: +p.target || 0, stop: +p.stop || 0 }
+    : { ...w, qty: 0, entry: 0 };
 });
 
 function loadSettings() {
@@ -500,6 +504,7 @@ function drawCharts() {
   const { data, w } = cur;
   const lines = [];
   if (w.buy) lines.push({ price: w.buy, color: '#e8edf5', title: '매수' });
+  if (w.entry) lines.push({ price: w.entry, color: '#7fd99a', title: '매수목표' });
   if (w.stop) lines.push({ price: w.stop, color: '#4c9dff', title: '손절' });
   if (w.target) lines.push({ price: w.target, color: '#ff5b5b', title: '매도' });
   drawChart('c60', $('c60'), data.h60, cur.bb60, lines, 60, true);
@@ -507,7 +512,7 @@ function drawCharts() {
 }
 
 // ---- 맨 위 '내 보유' 칸 (매수 평균가·수량·매도 목표가·손절가) ----
-const POS_FIELDS = { pBuy: 'buy', pQty: 'qty', pTarget: 'target', pStop: 'stop' };
+const POS_FIELDS = { pBuy: 'buy', pQty: 'qty', pEntry: 'entry', pTarget: 'target', pStop: 'stop' };
 const numOf = (v) => Number(String(v).replace(/[^\d.]/g, '')) || 0;
 function fillPos(w) {
   for (const [id, k] of Object.entries(POS_FIELDS)) $(id).value = w[k] ? fmt(w[k]) : '';
@@ -529,6 +534,7 @@ function renderPos() {
     out.push(`<span>매수가 대비 <b class="${cls(price - w.buy)}">${pct(price, w.buy)}%</b></span>`);
     if (w.qty) out.push(`<span>매수금액 ${won(w.buy * w.qty)} · 평가 ${won(price * w.qty)} · <b class="${cls(price - w.buy)}">손익 ${won((price - w.buy) * w.qty, true)}</b></span>`);
   }
+  if (w.entry) out.push(`<span style="color:#7fd99a">매수 목표까지 ${pct(w.entry, price)}%</span>`);
   if (w.target) out.push(`<span class="up">매도 목표까지 ${pct(w.target, price)}%${w.buy && w.qty ? ` (도달 시 ${won((w.target - w.buy) * w.qty, true)})` : ''}</span>`);
   if (w.stop) out.push(`<span class="down">손절까지 ${pct(w.stop, price)}%${w.buy && w.qty ? ` (손절 시 ${won((w.stop - w.buy) * w.qty, true)})` : ''}</span>`);
   if (w.stop && price <= w.stop) out.push('<b class="down">⚠ 현재가가 손절가 이하</b>');
@@ -536,6 +542,7 @@ function renderPos() {
 }
 // AI 답의 추천 매도가·손절가를 '내 보유' 칸에 적기
 function applyPicks(p) {
+  if (p.buy) $('pEntry').value = fmt(p.buy);
   if (p.sell) $('pTarget').value = fmt(p.sell);
   if (p.stop) $('pStop').value = fmt(p.stop);
   savePos();
@@ -617,7 +624,7 @@ function positionLine() {
 function renderChat() {
   const list = chats[cur.code] || [];
   $('chatLog').innerHTML = list.map((m, i) =>
-    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${(m.warnings || []).map((w) => `<div class="warnLine">${esc(w)}</div>`).join('')}${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}${m.picks && (m.picks.sell || m.picks.stop) ? `<button class="pickBtn" data-pick="${i}">📌 ${[m.picks.sell && `매도 ${fmt(m.picks.sell)}`, m.picks.stop && `손절 ${fmt(m.picks.stop)}`].filter(Boolean).join(' · ')} → 내 보유칸에 적기</button>` : ''}${m.meta ? `<div class="ansMeta">${esc(m.meta)}</div>` : ''}</div>`).join('');
+    `<div class="msg ${m.role}${m.error ? ' error' : ''}">${(m.warnings || []).map((w) => `<div class="warnLine">${esc(w)}</div>`).join('')}${m.role === 'model' && !m.error ? mdLite(m.text) : esc(m.text)}${m.picks && (m.picks.buy || m.picks.sell || m.picks.stop) ? `<button class="pickBtn" data-pick="${i}">📌 ${[m.picks.buy && `매수 ${fmt(m.picks.buy)}`, m.picks.sell && `매도 ${fmt(m.picks.sell)}`, m.picks.stop && `손절 ${fmt(m.picks.stop)}`].filter(Boolean).join(' · ')} → 내 보유칸에 적기</button>` : ''}${m.meta ? `<div class="ansMeta">${esc(m.meta)}</div>` : ''}</div>`).join('');
   const last = [...list].reverse().find((m) => m.sent);
   $('sentBox').hidden = !last;
   $('sentText').textContent = last ? last.sent : '';
@@ -654,7 +661,7 @@ async function ask(question, preset) {
         price: cur.data.price,
         position: positionLine(),
         // 매수·매도·손절가 버튼: 보유 여부 판단용으로 설정의 매수가·손절가·익절가(가격만, 수량 없음)를 함께 보냄
-        ...(preset === 'trade' ? { holding: { buy: cur.w.buy || 0, stop: cur.w.stop || 0, target: cur.w.target || 0 } } : {}),
+        ...(preset === 'trade' ? { holding: { buy: cur.w.buy || 0, entry: cur.w.entry || 0, stop: cur.w.stop || 0, target: cur.w.target || 0 } } : {}),
         ...($('sendPlan').checked ? { plan: $('planMemo').value.trim(), event: $('eventMemo').value.trim() } : {}),
       }),
     });

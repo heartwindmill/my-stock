@@ -809,7 +809,12 @@ const TRADE_HEADINGS = ['결론', '매수 추천가', '매도 추천가', '손�
 // [보유 상태] 줄: 설정의 매수가 유무로 판단 (수량은 받지 않음)
 function holdingSection(h, price) {
   const buy = Number(h && h.buy) || 0, stop = Number(h && h.stop) || 0, target = Number(h && h.target) || 0;
-  const extra = [stop && `내가 정한 손절가 ${won(stop)}`, target && `내가 정한 익절가 ${won(target)}`].filter(Boolean);
+  const entry = Number(h && h.entry) || 0;
+  const extra = [
+    entry && `내가 정한 매수 목표가 ${won(entry)}`,
+    target && `내가 정한 매도 목표가 ${won(target)}`,
+    stop && `내가 정한 손절가 ${won(stop)}`,
+  ].filter(Boolean);
   if (!buy) return ['미보유 (매수가 미등록) — 매수 추천가와 손절가를 제시할 것', ...extra].join('\n');
   const lines = [`보유 중 — 매수가 ${won(buy)}${price > 0 ? `, 현재가 ${won(price)} (매수가 대비 ${sgn((price / buy - 1) * 100, 1)})` : ''} — 매도 추천가와 손절가를 제시할 것`, ...extra];
   if (stop && price > 0 && price <= stop) lines.push(`주의: 현재가가 내가 정한 손절가 ${won(stop)} 이하임`);
@@ -868,8 +873,9 @@ function historySummary(turns) {
   }).join('\n');
 }
 
-function buildAskMessage({ facts, plan, position, event, price, turns, question, focus }) {
+function buildAskMessage({ facts, plan, position, event, price, turns, question, focus, holding }) {
   let s = `[사실]\n${facts.map((l) => `- ${l}`).join('\n')}\n\n`;
+  if (holding) s += `[보유 상태]\n${holding}\n\n`;
   s += `[사용자 계획]\n${planSection(plan, position, price)}\n\n`;
   s += `[이벤트]\n${event || '(없음)'}\n\n`;
   if (turns.length) s += `[이전 대화 요약]\n${historySummary(turns)}\n\n`;
@@ -969,23 +975,30 @@ async function generateChecked(env, colo, { system, config, sent, check, fixHint
   return { answer: c.answer, retries, warnings };
 }
 
-// 매수·매도·손절가 답에서 '내 보유칸'에 적을 값 추출: 매도 추천가 구역의 첫 가격, 손절 종가
+// 매수·매도·손절가 답에서 '내 보유칸'에 적을 값 추출
+// 매수 추천가 구역의 첫 가격(1차), 매도 추천가 구역의 첫 가격(1차), 손절 종가
 function tradePicks(text) {
   const lines = String(text).split('\n');
   const firstWon = (s) => {
     const m = s.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*원/);
     return m ? Number(m[1].replace(/,/g, '')) : 0;
   };
-  let sell = 0;
-  const i = lines.findIndex((l) => /매도 추천가/.test(l));
-  if (i >= 0) {
-    for (let j = i; j < lines.length && !sell; j++) {
-      if (j > i && /손절 기준|판단 근거|반대 근거/.test(lines[j])) break;
-      sell = firstWon(lines[j].replace(/^.*?매도 추천가/, ''));
+  const firstIn = (title, stops) => {
+    const i = lines.findIndex((l) => l.includes(title));
+    if (i < 0) return 0;
+    for (let j = i; j < lines.length; j++) {
+      if (j > i && stops.test(lines[j])) break;
+      const v = firstWon(j === i ? lines[j].slice(lines[j].indexOf(title) + title.length) : lines[j]);
+      if (v) return v;
     }
-  }
+    return 0;
+  };
   const m = String(text).match(/종가\s*(\d{1,3}(?:,\d{3})+|\d+)\s*원\s*이하/);
-  return { sell, stop: m ? Number(m[1].replace(/,/g, '')) : 0 };
+  return {
+    buy: firstIn('매수 추천가', /매도 추천가|손절 기준|판단 근거|반대 근거/),
+    sell: firstIn('매도 추천가', /손절 기준|판단 근거|반대 근거/),
+    stop: m ? Number(m[1].replace(/,/g, '')) : 0,
+  };
 }
 
 async function handleAsk(request, env, origin) {
@@ -1016,7 +1029,7 @@ async function handleAsk(request, env, origin) {
   const allowed = [...new Set([
     ...pricesIn(facts.join('\n'), price, false),
     ...parsePlan(plan, price).prices,
-    ...pricesIn(`${plan}\n${position}\n${event}`, price, false),
+    ...pricesIn(`${plan}\n${position}\n${event}\n${holding}`, price, false),
     ...(price ? [price] : []),
   ])].filter((v) => v > 0);
 
