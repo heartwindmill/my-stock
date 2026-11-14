@@ -3,7 +3,7 @@
 // - 한국투자증권(KIS) Open API로 국내 주식·ETF 시세(현재가·일봉·분봉)만 조회합니다.
 // - 주문·잔고·계좌 API는 일부러 넣지 않았습니다.
 // - 키는 코드에 없습니다. Cloudflare 대시보드의 Secret에서 읽습니다.
-// - 주소: GET /price, GET /chart, GET /facts, POST /analyze, POST /ask
+// - 주소: GET /price, GET /chart, GET /facts, POST /recommend, POST /ask
 //
 // 필요한 설정 (Settings → Variables and Secrets)
 //   KIS_ENV        (Text)   mock 또는 real
@@ -685,45 +685,107 @@ async function callGemini(env, payload, colo) {
 }
 
 // ---------------------------------------------------------------------
-// AI 분석 (목록 화면) — 시세 숫자만 보냄. 보유 수량·금액은 보내지 않음
+// AI 추천 (목록 화면) — 관심종목의 일봉 판단 재료를 비교해 지금 들어가기 좋아 보이는 종목 고르기
+// 종목당 KIS 호출 1회(일봉만, 60분봉 제외 → Worker 요청 수 한도 안). 보유 수량·금액은 받지 않음(보유 여부만)
 // ---------------------------------------------------------------------
-async function handleAnalyze(request, env, origin) {
+const RECOMMEND_PROMPT = `너는 한국 주식 스윙 매매를 돕는 신중한 분석 도우미다.
+아래 [종목별 사실]은 사용자가 고른 관심종목의 일봉 기준 판단 재료다. 이 숫자만 사용하고, 목록에 없는 가격·뉴스·실적·일정은 만들지 말라.
+할 일: 지금(다음 거래일 포함) 새로 들어가기 좋아 보이는 종목을 최대 3개, 좋은 순서로 골라라. 좋은 자리가 없으면 억지로 고르지 말고 "지금은 추천할 종목 없음"이라고 써라.
+좋은 진입 자리 기준: 일봉 중심선이 상승 또는 횡보 + 현재가가 가까운 지지선 근처(지지까지 거리가 평균 일중 변동폭의 0.5~2배) + 위 저항까지 헤드룸이 지지까지 거리보다 큼. 상단 돌파·과열(%B 100 이상), 중심선 하락 중 하단 이탈은 피할 것.
+답변 형식(제목 그대로):
+추천 종목: 종목마다 아래 4줄
+■ 종목명 (보유 중이면 "· 보유 중" 표시)
+- 매수 추천가: 1차 X원 · 2차 Y원 (어느 지지선인지, 진입 조건 한 줄)
+- 손절: 종가 Z원 이하로 마감하면 손절 (1차 매수가 대비 -n%)
+- 매도 목표: 1차 W원 (어느 저항선인지, 1차 매수가 대비 +m%) · 추천 이유 한 줄
+지금은 피할 종목: 1~3개. "종목명 — 이유 한 줄"
+마지막 줄: "참고용 정보이며 투자 판단과 책임은 본인에게 있습니다."
+규칙: 가격은 [종목별 사실]에 있는 숫자를 그대로 골라 쓸 것(새로 계산한 가격 금지, %만 계산 가능). 수익 보장·확언 금지. 손절은 가격 하나로 단정. 미국지수 ETF는 장기 분할 관점으로만 언급. 쉬운 한국어, 짧게.`;
+const RECOMMEND_HEADINGS = ['추천 종목', '지금은 피할 종목'];
+const RECOMMEND_GEN_CONFIG = { temperature: 0.3, maxOutputTokens: 1200 };
+// 추천 비교에 쓸 판단 재료 줄만 (시가·고가 등은 빼서 입력을 줄임)
+const KEEP_FACT = /^(현재가 |일봉 BB|현재가는 일봉|최근 20거래일|위 저항|아래 지지|다음 저항까지|최근 20일 평균|⚠ 손절 폭)|시험 중/;
+
+async function handleRecommend(request, env, origin) {
   if (!aiReady(env)) return json({ error: AI_NOT_READY }, 400, origin);
   const body = await request.json().catch(() => ({}));
-  const items = Array.isArray(body.items) ? body.items.slice(0, MAX_CODES) : [];
-  if (items.length === 0) return json({ error: '분석할 시세가 없습니다' }, 400, origin);
+  const items = (Array.isArray(body.items) ? body.items : [])
+    .filter((i) => i && /^[0-9A-Z]{6,7}$/.test(String(i.code)))
+    .slice(0, MAX_CODES);
+  if (items.length === 0) return json({ error: '추천할 관심종목이 없습니다' }, 400, origin);
 
-  const lines = items
-    .map((i) => `- ${String(i.name).slice(0, 40)}: 현재가 ${i.price}원, 전일대비 ${i.change}원 (${i.rate}%)`)
-    .join('\n');
+  const token = await getToken(env);
+  const blocks = [];
+  const failed = [];
+  const allowed = new Set();
+  let session = '';
+  for (let k = 0; k < items.length; k++) {
+    const it = items[k];
+    const name = String(it.name || it.code).slice(0, 40);
+    if (k) await sleep(callGap(env));
+    try {
+      const d = await fetchDaily(env, token, it.code);
+      const f = computeFacts({ price: d.price, change: d.change, daily: d.bars, h60: [] });
+      if (!session) session = f.lines[0];
+      const lines = f.lines.filter((l) => KEEP_FACT.test(l));
+      blocks.push(`■ ${name} (${it.code})${it.owned ? ' · 보유 중' : ''}\n${lines.map((l) => `- ${l}`).join('\n')}`);
+      for (const v of pricesIn(lines.join('\n'), 0, false)) allowed.add(v);
+    } catch (e) {
+      failed.push(`${name}: ${String(e.message || e).slice(0, 80)}`);
+    }
+  }
+  if (!blocks.length) return json({ error: `시세를 가져오지 못했습니다 (${failed.join(' / ')})` }, 502, origin);
 
-  const prompt = `너는 장기 연금 투자자를 돕는 시장 요약 도우미다. 아래는 오늘(${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })} KST) 관심종목 시세다.
-${lines}
-
-다음 형식으로 한국어로 짧게 답하라.
-1) 한 줄 요약
-2) 상승·기본·하락 시나리오 각 1줄
-3) 오늘 점검 필요 여부 (필요/불필요 + 이유 1줄)
-규칙: 매수·매도 지시나 수익 보장 표현 금지. 확실하지 않은 원인(뉴스 등)은 추측하지 말고 "확인 필요"라고 쓸 것. 연금 계좌는 장기 분산 관점을 유지할 것.`;
-
-  const result = await callGemini(env, { contents: [{ role: 'user', parts: [{ text: prompt }] }] }, request.cf?.colo);
-  return json(result, result.error ? 502 : 200, origin);
+  const sent = `[기준] ${session}\n\n[종목별 사실]\n${blocks.join('\n\n')}${failed.length ? `\n\n(조회 실패로 제외: ${failed.map((x) => x.split(':')[0]).join(', ')})` : ''}`;
+  const model = env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  const allowList = [...allowed];
+  const r = await generateChecked(env, request.cf?.colo, {
+    system: RECOMMEND_PROMPT,
+    config: RECOMMEND_GEN_CONFIG,
+    sent,
+    check: (text) => {
+      const answer = String(text).replace(/\r/g, '');
+      return { answer, ...validateAnswer(answer, allowList, 0, RECOMMEND_HEADINGS) };
+    },
+    fixHint: '가격은 반드시 [종목별 사실]에 있는 숫자만 그대로 쓸 것.',
+  });
+  if (r.error) return json({ ...r, model, sent, retries: 0 }, r.rateLimited ? 429 : 502, origin);
+  const warnings = [...r.warnings];
+  if (failed.length) warnings.push(`⚠ 조회 실패로 제외: ${failed.join(' / ')}`);
+  return json({ text: withDisclaimer(r.answer), model, sent, retries: r.retries, warnings }, 200, origin);
 }
 
 // ---------------------------------------------------------------------
 // AI 질문 (상세 화면) — 스윙 관점 분석 도우미
 // 사용자 메시지 = [사실](판단 재료) + [사용자 계획] + [이벤트] + [이전 대화 요약] + [질문]
 // ---------------------------------------------------------------------
-const ADVISOR_PROMPT = `너는 한국 주식 스윙 매매를 돕는 신중한 분석 도우미다.
-반드시 아래 [사실] 목록에 있는 숫자·날짜만 사용하라. 목록에 없는 가격, 뉴스, 실적, 일정은 만들지 말고 필요하면 "확인 필요"라고 써라.
+const ADVISOR_BASE = `너는 한국 주식 스윙 매매를 돕는 신중한 분석 도우미다.
+반드시 아래 [사실] 목록에 있는 숫자·날짜만 사용하라. 목록에 없는 가격, 뉴스, 실적, 일정은 만들지 말고 필요하면 "확인 필요"라고 써라.`;
+const ADVISOR_TAIL = `마지막 줄: "참고용 정보이며 투자 판단과 책임은 본인에게 있습니다."`;
+
+// 종합 판단 형식
+const ADVISOR_PROMPT = `${ADVISOR_BASE}
 답변 형식(제목 그대로 사용):
 결론: (한두 문장. 지금 할 행동을 '대기/분할 검토/보유 유지/비중 축소 검토' 중 하나로, 이유 한 줄)
 화면 확인 (기준시각): 핵심 수치 3~5개 불릿
 판단 근거: 2~4행 표 (항목 | 내용). 이벤트, 지지/저항, 손절 폭 대비 변동성, 헤드룸 중 해당되는 것
 종가 조건별 다음 계획: "종가 X 위: … / 종가 X 아래: …" 2~3줄. 사용자 계획이 있으면 그 이름(A안·B안)과 가격을 그대로 사용
 반대 근거: 1~2줄. 내 결론이 틀릴 수 있는 이유와 그 경우의 비용
-마지막 줄: "참고용 정보이며 투자 판단과 책임은 본인에게 있습니다."
+${ADVISOR_TAIL}
 규칙: 매수·매도 단정, 수익 보장, 목표가 확언 금지. 손절 기준은 항상 '종가 기준 가격'으로 제시. 연금 계좌 ETF는 장기 분산 관점 유지. 쉬운 한국어, 결론 먼저.`;
+
+// 매수·매도·손절가 형식 (보유 여부에 따라 내용이 달라짐 → [보유 상태] 참고)
+const TRADE_PROMPT = `${ADVISOR_BASE}
+[보유 상태]를 먼저 보고, 보유 중이면 매도 추천가와 손절가 중심으로, 미보유면 매수 추천가와 손절가 중심으로 답하라.
+답변 형식(제목 그대로 사용, 짧게):
+결론: 한 문장. 보유 중이면 '보유 유지/일부 익절 검토/손절' 중 하나, 미보유면 '매수 대기/분할 매수 검토' 중 하나와 이유
+매수 추천가: 미보유면 분할 매수 1차·2차(필요시 3차) 가격과 각각의 진입 조건(종가 조건). 보유 중이면 추가 매수를 권하지 않으면 "추가 매수: 권하지 않음"과 이유 한 줄, 권하면 가격 1개와 조건
+매도 추천가: 보유 중이면 1차·2차 익절 가격과 각각 매수가 대비 수익률(%). 미보유면 위 매수가로 들어갔을 때의 1차·2차 목표 매도가
+손절 기준: 첫 줄은 반드시 "종가 X원 이하로 마감하면 손절" 형식으로 가격 딱 하나. 둘째 줄에 기준가(보유 중이면 매수가, 미보유면 1차 매수가) 대비 손실률(%)과 근거(어느 지지선 아래인지, 평균 일중 변동폭 대비 거리). 현재가가 이미 그 손절가 이하이면 "이미 손절 기준 이하"라고 분명히 쓸 것
+판단 근거: 2~3줄 불릿
+반대 근거: 1줄
+${ADVISOR_TAIL}
+규칙: 모든 가격은 [사실]·[사용자 계획]·[보유 상태]에 있는 숫자를 그대로 골라 쓸 것(새로 계산한 가격 금지, 수익률·손실률 %만 계산 가능). 매수·매도 가격은 조건부 계획으로 쓰고 수익 보장·목표가 확언 금지. 단, 손절은 예외 없이 지키는 규칙이므로 "~이하면 손절"로 단정해서 쓸 것. 사용자가 정한 손절가가 있으면 그것과 비교해 더 타당한 쪽을 하나만 제시. 쉬운 한국어.`;
 
 // 빠른 질문 버튼: 질문 유형별 강조점
 const PRESETS = {
@@ -731,25 +793,28 @@ const PRESETS = {
     q: '지금 일봉·60분봉 기준으로 종합 판단해줘',
     focus: '전체 형식을 균형 있게 채우고, 결론의 행동 하나를 분명히 할 것.',
   },
-  buy: {
-    q: '지금이 매수 타이밍이야?',
-    focus: '진입 조건(어떤 종가·신호가 나오면 들어가는지)과 분할 매수 가격대 2~3개를 [사실]의 지지선 숫자로 제시. 진입 시 손절 종가도 함께.',
-  },
-  sell: {
-    q: '지금 매도·익절 타이밍이야?',
-    focus: '익절·분할 매도 조건과 가격대를 [사실]의 저항선 숫자로 제시. 남은 물량을 계속 보유할 조건도 함께.',
-  },
-  stop: {
-    q: '손절 기준을 어디로 잡아야 할까?',
-    focus: '종가 기준 손절선 1~2개와 근거(어느 지지선 아래인지, 평균 일중 변동폭 대비 거리). 손절 폭이 너무 좁으면 노이즈 위험을 지적.',
-  },
-  squeeze: {
-    q: '밴드폭이 수축(스퀴즈) 중이야?',
-    focus: '일봉·60분봉 밴드폭과 20봉 평균을 비교해 수축/확장을 해석하고, 위·아래 돌파 각각의 종가 조건과 대응을 제시.',
+  trade: {
+    q: '매수·매도·손절 가격을 알려줘',
+    trade: true,
+    focus: '보유 중이면 매도 추천가(저항선)와 손절가, 미보유면 매수 추천가(지지선)와 손절가. 손절은 가격 하나로 단정.',
   },
 };
+// 예전 버튼(캐시된 화면)에서 온 요청도 새 버튼으로 처리
+PRESETS.buy = PRESETS.sell = PRESETS.stop = PRESETS.trade;
 
 const GEN_CONFIG = { temperature: 0.3, maxOutputTokens: 900 };
+const TRADE_GEN_CONFIG = { temperature: 0.3, maxOutputTokens: 1000 };
+const TRADE_HEADINGS = ['결론', '매수 추천가', '매도 추천가', '손절 기준', '판단 근거', '반대 근거'];
+
+// [보유 상태] 줄: 설정의 매수가 유무로 판단 (수량은 받지 않음)
+function holdingSection(h, price) {
+  const buy = Number(h && h.buy) || 0, stop = Number(h && h.stop) || 0, target = Number(h && h.target) || 0;
+  const extra = [stop && `내가 정한 손절가 ${won(stop)}`, target && `내가 정한 익절가 ${won(target)}`].filter(Boolean);
+  if (!buy) return ['미보유 (매수가 미등록) — 매수 추천가와 손절가를 제시할 것', ...extra].join('\n');
+  const lines = [`보유 중 — 매수가 ${won(buy)}${price > 0 ? `, 현재가 ${won(price)} (매수가 대비 ${sgn((price / buy - 1) * 100, 1)})` : ''} — 매도 추천가와 손절가를 제시할 것`, ...extra];
+  if (stop && price > 0 && price <= stop) lines.push(`주의: 현재가가 내가 정한 손절가 ${won(stop)} 이하임`);
+  return lines.join('\n');
+}
 
 // ---------------------------------------------------------------------
 // 사용자 계획 메모에서 가격·날짜 추출 → "사용자 계획" 사실로 붙임
@@ -854,9 +919,9 @@ function pricesIn(text, price, strict) {
   return out;
 }
 
-function validateAnswer(text, allowed, price) {
+function validateAnswer(text, allowed, price, headings = HEADINGS) {
   const problems = [];
-  for (const h of HEADINGS) {
+  for (const h of headings) {
     if (!new RegExp(`^[^\\S\\n]*[#*•-]*[^\\S\\n]*\\**${h}`, 'm').test(text)) problems.push(`'${h}' 제목이 없음`);
   }
   const wrong = [...new Set(pricesIn(text, price, true))].filter((v) => !allowed.some((a) => Math.abs(v / a - 1) <= 0.005));
@@ -867,6 +932,60 @@ function validateAnswer(text, allowed, price) {
 
 function withDisclaimer(text) {
   return text.includes('투자 판단과 책임은 본인에게') ? text : `${text.trimEnd()}\n\n${DISCLAIMER}`;
+}
+
+// Gemini 호출 + 검증 + (문제 있으면) 1회 재요청 — 질문당 Gemini 호출 최대 2회
+// check(text) → { answer, problems, wrong }
+async function generateChecked(env, colo, { system, config, sent, check, fixHint }) {
+  const base = { systemInstruction: { parts: [{ text: system }] }, generationConfig: config };
+  const first = await callGemini(env, { ...base, contents: [{ role: 'user', parts: [{ text: sent }] }] }, colo);
+  if (first.error) return first;
+  let c = check(first.text);
+  if (first.finishReason === 'MAX_TOKENS') c.problems.push('답이 길어 중간에 잘림 (더 짧게)');
+  let retries = 0;
+  if (c.problems.length) {
+    retries = 1;
+    const fix = `다음 문제를 고쳐 같은 형식으로 다시 써라: ${c.problems.join(' / ')}\n${fixHint}`;
+    const second = await callGemini(env, {
+      ...base,
+      contents: [
+        { role: 'user', parts: [{ text: sent }] },
+        { role: 'model', parts: [{ text: first.text }] },
+        { role: 'user', parts: [{ text: fix }] },
+      ],
+    }, colo);
+    if (!second.error) {
+      const c2 = check(second.text);
+      if (second.finishReason === 'MAX_TOKENS') c2.problems.push('답이 길어 중간에 잘림');
+      if (c2.problems.length <= c.problems.length) c = c2;
+    } else if (second.rateLimited) {
+      c.problems.push('재검토 요청이 무료 한도에 걸림 (첫 답변 표시)');
+    }
+  }
+  const warnings = [];
+  if (c.wrong.length) warnings.push(`⚠ 일부 수치가 원자료와 다릅니다: ${c.wrong.slice(0, 6).map(won).join(', ')}`);
+  const other = c.problems.filter((p) => !p.startsWith('[사실]'));
+  if (other.length) warnings.push(`⚠ 형식 검사 미통과: ${other.join(' / ')}`);
+  return { answer: c.answer, retries, warnings };
+}
+
+// 매수·매도·손절가 답에서 '내 보유칸'에 적을 값 추출: 매도 추천가 구역의 첫 가격, 손절 종가
+function tradePicks(text) {
+  const lines = String(text).split('\n');
+  const firstWon = (s) => {
+    const m = s.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*원/);
+    return m ? Number(m[1].replace(/,/g, '')) : 0;
+  };
+  let sell = 0;
+  const i = lines.findIndex((l) => /매도 추천가/.test(l));
+  if (i >= 0) {
+    for (let j = i; j < lines.length && !sell; j++) {
+      if (j > i && /손절 기준|판단 근거|반대 근거/.test(lines[j])) break;
+      sell = firstWon(lines[j].replace(/^.*?매도 추천가/, ''));
+    }
+  }
+  const m = String(text).match(/종가\s*(\d{1,3}(?:,\d{3})+|\d+)\s*원\s*이하/);
+  return { sell, stop: m ? Number(m[1].replace(/,/g, '')) : 0 };
 }
 
 async function handleAsk(request, env, origin) {
@@ -886,7 +1005,10 @@ async function handleAsk(request, env, origin) {
   const position = String(body.position || '').trim().slice(0, 300);
   const event = String(body.event || '').trim().slice(0, 1000);
   const price = Number(body.price) || 0;
-  const sent = buildAskMessage({ facts, plan, position, event, price, turns, question, focus: preset ? preset.focus : '' });
+  const isTrade = !!(preset && preset.trade);
+  const holding = isTrade ? holdingSection(body.holding, price) : '';
+  const sent = buildAskMessage({ facts, plan, position: isTrade ? '' : position, event, price, turns, question, focus: preset ? preset.focus : '', holding });
+  const headings = isTrade ? TRADE_HEADINGS : HEADINGS;
   const model = env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
   const colo = request.cf?.colo;
 
@@ -898,46 +1020,21 @@ async function handleAsk(request, env, origin) {
     ...(price ? [price] : []),
   ])].filter((v) => v > 0);
 
-  const base = {
-    systemInstruction: { parts: [{ text: ADVISOR_PROMPT }] },
-    generationConfig: GEN_CONFIG,
-  };
-  const first = await callGemini(env, { ...base, contents: [{ role: 'user', parts: [{ text: sent }] }] }, colo);
-  if (first.error) return json({ ...first, model, sent, retries: 0 }, first.rateLimited ? 429 : 502, origin);
-
-  let answer = normalizeAnswer(first.text, facts);
-  let check = validateAnswer(answer, allowed, price);
-  if (first.finishReason === 'MAX_TOKENS') check.problems.push('답이 길어 중간에 잘림 (더 짧게)');
-  let retries = 0;
-
-  // 문제 있으면 1회만 재요청 (질문당 Gemini 호출 최대 2회)
-  if (check.problems.length) {
-    retries = 1;
-    const fix = `다음 문제를 고쳐 같은 형식으로 다시 써라: ${check.problems.join(' / ')}\n가격은 반드시 [사실]과 [사용자 계획]에 있는 숫자만 그대로 쓸 것.`;
-    const second = await callGemini(env, {
-      ...base,
-      contents: [
-        { role: 'user', parts: [{ text: sent }] },
-        { role: 'model', parts: [{ text: first.text }] },
-        { role: 'user', parts: [{ text: fix }] },
-      ],
-    }, colo);
-    if (!second.error) {
-      const a2 = normalizeAnswer(second.text, facts);
-      const c2 = validateAnswer(a2, allowed, price);
-      if (second.finishReason === 'MAX_TOKENS') c2.problems.push('답이 길어 중간에 잘림');
-      if (c2.problems.length <= check.problems.length) { answer = a2; check = c2; }
-    } else if (second.rateLimited) {
-      check.problems.push('재검토 요청이 무료 한도에 걸림 (첫 답변 표시)');
-    }
-  }
-
-  const warnings = [];
-  if (check.wrong.length) warnings.push(`⚠ 일부 수치가 원자료와 다릅니다: ${check.wrong.slice(0, 6).map(won).join(', ')}`);
-  const other = check.problems.filter((p) => !p.startsWith('[사실]'));
-  if (other.length) warnings.push(`⚠ 형식 검사 미통과: ${other.join(' / ')}`);
-
-  return json({ text: withDisclaimer(answer), model, sent, retries, warnings }, 200, origin);
+  const r = await generateChecked(env, colo, {
+    system: isTrade ? TRADE_PROMPT : ADVISOR_PROMPT,
+    config: isTrade ? TRADE_GEN_CONFIG : GEN_CONFIG,
+    sent,
+    check: (text) => {
+      const answer = normalizeAnswer(text, facts);
+      return { answer, ...validateAnswer(answer, allowed, price, headings) };
+    },
+    fixHint: '가격은 반드시 [사실]·[사용자 계획]·[보유 상태]에 있는 숫자만 그대로 쓸 것.',
+  });
+  if (r.error) return json({ ...r, model, sent, retries: 0 }, r.rateLimited ? 429 : 502, origin);
+  return json({
+    text: withDisclaimer(r.answer), model, sent, retries: r.retries, warnings: r.warnings,
+    ...(isTrade ? { picks: tradePicks(r.answer) } : {}),
+  }, 200, origin);
 }
 
 // ---------------------------------------------------------------------
@@ -965,7 +1062,7 @@ export default {
       if (request.method === 'GET' && pathname === '/price') return await handlePrice(request, env, origin);
       if (request.method === 'GET' && pathname === '/chart') return await handleChart(request, env, origin);
       if (request.method === 'GET' && pathname === '/facts') return await handleFacts(request, env, origin);
-      if (request.method === 'POST' && pathname === '/analyze') return await handleAnalyze(request, env, origin);
+      if (request.method === 'POST' && pathname === '/recommend') return await handleRecommend(request, env, origin);
       if (request.method === 'POST' && pathname === '/ask') return await handleAsk(request, env, origin);
       return json({ error: '없는 주소입니다' }, 404, origin);
     } catch (e) {
